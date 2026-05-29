@@ -31,7 +31,7 @@ This plan was rewritten after a critical review of the first draft. Key correcti
 ### Session Start
 
 1. Read `CLAUDE.md` — stack, Makefile commands, testing strategy, architecture notes
-2. Identify your task number (check open GitHub issues: `gh issue list --state open`)
+2. Identify your task (check open GitHub issues: `gh issue list --state open` — each issue title starts with `Task N:`). **Note:** GitHub issue numbers are NOT the same as task numbers (they were created out of order); use the exact `gh issue close <#>` command printed in your task header.
 3. Read the full task section below including prerequisites, steps, and code
 4. Verify prerequisites: run the file-existence checks at the top of your task
 5. Run `pnpm install` from the repo root if `node_modules` are missing
@@ -42,7 +42,7 @@ After the task's final commit:
 
 ```bash
 git push
-gh issue close #N   # replace N with your task number
+gh issue close <#>   # use the issue number from YOUR task header (≠ task number)
 ```
 
 Then mark the task completed in the Claude Code task list (TaskUpdate → completed).
@@ -404,7 +404,7 @@ git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, w
 
 ## Task 2: Types & D1 Schema
 
-**GitHub issue:** #2 — close with `gh issue close 2` at session end
+**GitHub issue:** #3 — close with `gh issue close 3` at session end
 
 **Prerequisites:** Task 1 complete. Verify:
 ```bash
@@ -585,14 +585,14 @@ Expected: "Successfully executed N commands"
 
 ```bash
 git add worker/src/types.ts worker/schema.sql
-git commit -m "feat: types and D1 schema (per-trip token, analysis cache, no audio features)" && git push && gh issue close 2
+git commit -m "feat: types and D1 schema (per-trip token, analysis cache, no audio features)" && git push && gh issue close 3
 ```
 
 ---
 
 ## Task 3: Utils & D1 Helpers
 
-**GitHub issue:** #3 — close with `gh issue close 3` at session end
+**GitHub issue:** #6 — close with `gh issue close 6` at session end
 
 **Prerequisites:** Task 2 complete. Verify:
 ```bash
@@ -863,14 +863,14 @@ export async function setAnalysisCache(
 
 ```bash
 git add worker/src/utils.ts worker/src/db.ts worker/test/
-git commit -m "feat: utils and D1 helpers — per-trip token, single-JOIN leaderboard, analysis cache" && git push && gh issue close 3
+git commit -m "feat: utils and D1 helpers — per-trip token, single-JOIN leaderboard, analysis cache" && git push && gh issue close 6
 ```
 
 ---
 
 ## Task 4: Spotify Client
 
-**GitHub issue:** #4 — close with `gh issue close 4` at session end
+**GitHub issue:** #5 — close with `gh issue close 5` at session end
 
 **Prerequisites:** Task 3 complete. Verify:
 ```bash
@@ -1055,14 +1055,14 @@ Expected: PASS
 
 ```bash
 git add worker/src/spotify.ts worker/test/spotify.test.ts
-git commit -m "feat: Spotify client — token refresh, OAuth code exchange, hardened currently-playing" && git push && gh issue close 4
+git commit -m "feat: Spotify client — token refresh, OAuth code exchange, hardened currently-playing" && git push && gh issue close 5
 ```
 
 ---
 
 ## Task 5: Claude Taste Generator
 
-**GitHub issue:** #5 — close with `gh issue close 5` at session end
+**GitHub issue:** #7 — close with `gh issue close 7` at session end
 
 **Prerequisites:** Task 4 complete. Verify:
 ```bash
@@ -1168,14 +1168,14 @@ Respond in JSON: { "summary": "...", "topGenre": "...", "vibe": "..." }`
 
 ```bash
 git add worker/src/claude.ts
-git commit -m "feat: Claude client — personality + group taste inferred from titles/artists/scores" && git push && gh issue close 5
+git commit -m "feat: Claude client — personality + group taste inferred from titles/artists/scores" && git push && gh issue close 7
 ```
 
 ---
 
 ## Task 6: Durable Object — WebSocket Hub + Direct D1 Writes
 
-**GitHub issue:** #6 — close with `gh issue close 6` at session end
+**GitHub issue:** #4 — close with `gh issue close 4` at session end
 
 **Prerequisites:** Task 5 complete. Verify:
 ```bash
@@ -1497,14 +1497,14 @@ export class TripRoom implements DurableObject {
 
 ```bash
 git add worker/src/TripRoom.ts
-git commit -m "feat: TripRoom DO — WS hub, Spotify polling, direct D1 song/rating writes" && git push && gh issue close 6
+git commit -m "feat: TripRoom DO — WS hub, Spotify polling, direct D1 song/rating writes" && git push && gh issue close 4
 ```
 
 ---
 
 ## Task 7: Worker Entry Point, API Routes & Spotify OAuth
 
-**GitHub issue:** #7 — close with `gh issue close 7` at session end
+**GitHub issue:** #2 — close with `gh issue close 2` at session end
 
 **Prerequisites:** Task 6 complete. Verify:
 ```bash
@@ -1757,7 +1757,7 @@ Expected: `{"trip":{"id":"...","short_code":"XXXXXX",...}}`. Then `curl http://l
 
 ```bash
 git add worker/src/index.ts
-git commit -m "feat: Worker routes — trips, leaderboard, cached analysis, Spotify OAuth, WS upgrade" && git push && gh issue close 7
+git commit -m "feat: Worker routes — trips, leaderboard, cached analysis, Spotify OAuth, WS upgrade" && git push && gh issue close 2
 ```
 
 ---
@@ -2037,7 +2037,7 @@ git commit -m "feat: WebSocket hook with reactive connection state and auto-reco
 
 ## Task 10: Home Page — Create & Join Forms
 
-**GitHub issue:** #10 — close with `gh issue close 10` at session end
+**GitHub issue:** #16 — close with `gh issue close 16` at session end
 
 **Prerequisites:** Task 9 complete. Verify:
 ```bash
@@ -2319,14 +2319,14 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
 
 ```bash
 git add frontend/src/
-git commit -m "feat: Home page — create (→ Spotify OAuth) and join forms" && git push && gh issue close 10
+git commit -m "feat: Home page — create (→ Spotify OAuth) and join forms" && git push && gh issue close 16
 ```
 
 ---
 
 ## Task 11: Trip Page — Layout, Tabs, WebSocket & DJ Connect
 
-**GitHub issue:** #11 — close with `gh issue close 11` at session end
+**GitHub issue:** #10 — close with `gh issue close 10` at session end
 
 **Prerequisites:** Task 10 complete. Verify:
 ```bash
@@ -2542,14 +2542,14 @@ export default function ConnectSpotify({ tripId, isCreator, creatorName }: Props
 
 ```bash
 git add frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx frontend/src/components/ConnectSpotify.tsx
-git commit -m "feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt" && git push && gh issue close 11
+git commit -m "feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt" && git push && gh issue close 10
 ```
 
 ---
 
 ## Task 12: Current Song Tab
 
-**GitHub issue:** #12 — close with `gh issue close 12` at session end
+**GitHub issue:** #13 — close with `gh issue close 13` at session end
 
 **Prerequisites:** Task 11 complete. Verify:
 ```bash
@@ -2769,14 +2769,14 @@ export default function CurrentSong({ onRate }: Props) {
 
 ```bash
 git add frontend/src/components/
-git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown, reveal" && git push && gh issue close 12
+git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown, reveal" && git push && gh issue close 13
 ```
 
 ---
 
 ## Task 13: Leaderboard Tab
 
-**GitHub issue:** #13 — close with `gh issue close 13` at session end
+**GitHub issue:** #17 — close with `gh issue close 17` at session end
 
 **Prerequisites:** Task 12 complete. Verify:
 ```bash
@@ -2859,14 +2859,14 @@ export default function Leaderboard({ code }: Props) {
 
 ```bash
 git add frontend/src/components/Leaderboard.tsx
-git commit -m "feat: Leaderboard tab with hall of shame styling" && git push && gh issue close 13
+git commit -m "feat: Leaderboard tab with hall of shame styling" && git push && gh issue close 17
 ```
 
 ---
 
 ## Task 14: Analysis Tab
 
-**GitHub issue:** #14 — close with `gh issue close 14` at session end
+**GitHub issue:** #15 — close with `gh issue close 15` at session end
 
 **Prerequisites:** Task 13 complete. Verify:
 ```bash
@@ -2958,14 +2958,14 @@ function Tag({ label }: { label: string }) {
 
 ```bash
 git add frontend/src/components/Analysis.tsx
-git commit -m "feat: Analysis tab — group taste summary and Claude personality cards" && git push && gh issue close 14
+git commit -m "feat: Analysis tab — group taste summary and Claude personality cards" && git push && gh issue close 15
 ```
 
 ---
 
 ## Task 15: API Integration & Frontend Behavior Tests
 
-**GitHub issue:** #15 — close with `gh issue close 15` at session end
+**GitHub issue:** #11 — close with `gh issue close 11` at session end
 
 **Prerequisites:** Tasks 1–14 complete. Verify:
 ```bash
@@ -3137,14 +3137,14 @@ Expected: all PASS, no type errors.
 
 ```bash
 git add worker/test/api.test.ts frontend/src/components/__tests__ frontend/src/hooks/__tests__
-git commit -m "test: API integration (SELF) + frontend behavior tests" && git push && gh issue close 15
+git commit -m "test: API integration (SELF) + frontend behavior tests" && git push && gh issue close 11
 ```
 
 ---
 
 ## Task 16: Build & Playwright E2E (Golden Path)
 
-**GitHub issue:** #16 — close with `gh issue close 16` at session end
+**GitHub issue:** #12 — close with `gh issue close 12` at session end
 
 **Prerequisites:** Task 15 complete. Verify:
 ```bash
@@ -3188,14 +3188,14 @@ With a Spotify track playing on the connected account, confirm within ~10s a `so
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit --allow-empty -m "chore: E2E golden path verified via Playwright MCP" && git push && gh issue close 16
+git commit --allow-empty -m "chore: E2E golden path verified via Playwright MCP" && git push && gh issue close 12
 ```
 
 ---
 
 ## Task 17: Spotify App Setup & Deploy to Cloudflare
 
-**GitHub issue:** #17 — close with `gh issue close 17` at session end
+**GitHub issue:** #14 — close with `gh issue close 14` at session end
 
 **Prerequisites:** Task 16 complete. You need a Cloudflare account and a Spotify Developer app.
 
@@ -3255,7 +3255,7 @@ Expected output includes `https://listening-road-trip.<your-account>.workers.dev
 
 ```bash
 git add wrangler.toml
-git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, verified" && git push && gh issue close 17
+git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, verified" && git push && gh issue close 14
 ```
 
 ---

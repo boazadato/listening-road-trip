@@ -4,7 +4,7 @@
 
 Real-time road trip music rating app. The trip creator (the DJ) connects their own Spotify via in-app OAuth; their playback auto-broadcasts songs to the group via WebSocket. Everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
 
-**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. GitHub issues mirror each task: https://github.com/boazadato/listening-road-trip/issues — **note:** the plan was revised (Task 16 is now Playwright E2E; the old Spotify-token-script task is gone), so re-sync issue titles before running sessions.
+**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. GitHub issues mirror each task (titles synced to the revised plan): https://github.com/boazadato/listening-road-trip/issues — **note:** issue numbers do NOT equal task numbers (created out of order); each task header prints the exact `gh issue close <#>` to run.
 
 ## Tech Stack
 
