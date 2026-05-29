@@ -32,7 +32,7 @@ A second review found deploy-blockers and bugs that an agent would hit executing
 6. **Alarm never stopped** (Task 6) — the 5s Spotify poll rescheduled forever even with zero participants; now stops when no sockets are connected and resumes on reconnect (DO duration billing is live in 2026).
 7. **Spotify OAuth reality** (Tasks 4/17) — HTTPS-only redirect URIs (no `http://localhost`), dev-mode capped at 5 Premium users, no extended-quota path for individuals. Added a pre-Task-4 spike (`scripts/spotify-spike.mjs`) to validate the live API contract.
 
-Design tensions surfaced but **left as explicit decisions** (see "Open Design Decisions" near the end): rating-window vs. song length, analysis cache strategy, and DJ identification/OAuth auth.
+Design tensions surfaced and **resolved to defaults** (see "Resolved Design Decisions" near the end): rating-window vs. song length (keep loose), analysis cache strategy (regenerate every +5 songs — implemented), and DJ identification/OAuth auth (name-match accepted for hobby use, revisit before public).
 
 ---
 
@@ -944,7 +944,16 @@ ls worker/src/utils.ts worker/src/db.ts worker/test/utils.test.ts
 - Create: `worker/src/spotify.ts`
 - Create: `worker/test/spotify.test.ts`
 
-> **Validate the Spotify contract first.** Spotify is the highest-risk, least-mockable part of this app. Before implementing, run `scripts/spotify-spike.mjs` (see its header) against a real account to confirm: the `currently-playing` JSON shape `parseCurrentlyPlaying` assumes, the `204`/ad/podcast edge cases, and that the refresh token does not rotate. Fix the parser/types to match reality, then write the tests below to lock it in. (Requires a registered Spotify app with an HTTPS redirect URI and your account on the dev-mode allowlist — see Task 17.)
+> **Spotify contract — VALIDATED against a real account (2026-05-29)** via `scripts/spotify-spike.mjs`. Full OAuth dance (authorize → code exchange → refresh → currently-playing) works with an HTTPS redirect URI on the dev-mode allowlist. Confirmed shapes the parser/types are built around:
+>
+> | State | HTTP | `is_playing` | `currently_playing_type` | `item` | parser result |
+> |---|---|---|---|---|---|
+> | Playing a track | 200 | `true` | `track` | full track object | the track (id, name, `artists[].name`, `album.images[0].url`, `duration_ms` all present) |
+> | Paused | 200 | `false` | `track` | full track object | `null` (gated on `is_playing`) |
+> | Podcast episode | 200 | `true` | `episode` | **`null`** | `null` (gated on `!item`) |
+> | Nothing playing | 204 | — | — | — | `null` (gated on 204 in `fetchCurrentlyPlaying`) |
+>
+> Key findings: **podcasts/ads return `item: null`** (not a populated non-track item) because we don't request `additional_types=episode` — the `!r.item` guard is what actually skips them. **Paused returns the full item with `is_playing:false`** — gating on `is_playing` is required, and is safe because the DO keeps its stored `currentSong` so resuming doesn't re-broadcast (see `pollSpotify` Task 6). **The refresh token did NOT rotate** across repeated refreshes (no rotation warning) — the "store the refresh token once on the trip row" assumption holds. Ads were not directly observed (Premium account shows none) but share the podcast shape and the same guard. Delete `scripts/spotify-spike.mjs` once Task 4 is implemented and green.
 
 Note: `audio-features` is **not** implemented — Spotify deprecated it for apps created after 2024-11-27. Taste analysis infers genre/vibe from titles/artists/scores (Task 5).
 
@@ -995,8 +1004,21 @@ describe('parseCurrentlyPlaying', () => {
   })
 
   it('returns null for non-track items (ads, podcasts)', () => {
-    expect(parseCurrentlyPlaying({ is_playing: true, item: { type: 'episode', id: 'e1' } })).toBeNull()
+    // Validated against a real account 2026-05-29: a playing PODCAST returns
+    // `currently_playing_type: 'episode'` with `item: null` (we don't pass
+    // `additional_types=episode`), so the `!r.item` guard catches it. Ads behave
+    // the same (`item: null`). The `item.type !== 'track'` branch below is a
+    // defensive backstop in case `item` is ever populated for non-tracks.
+    expect(parseCurrentlyPlaying({ is_playing: true, currently_playing_type: 'episode', item: null })).toBeNull()
     expect(parseCurrentlyPlaying({ is_playing: true, currently_playing_type: 'ad', item: null })).toBeNull()
+    expect(parseCurrentlyPlaying({ is_playing: true, item: { type: 'episode', id: 'e1' } })).toBeNull()
+  })
+
+  it('returns null when paused (is_playing:false) even though item is populated', () => {
+    // Validated 2026-05-29: pausing returns HTTP 200 with the full track item
+    // and is_playing:false. We treat paused as "no current song"; the DO keeps
+    // its stored currentSong, so resuming the same track does NOT re-broadcast.
+    expect(parseCurrentlyPlaying({ is_playing: false, item: { type: 'track', id: 't1', name: 'x' } })).toBeNull()
   })
 
   it('extracts track info from Spotify response', () => {
@@ -1761,9 +1783,12 @@ async function analysisHandler(code: string, env: Env): Promise<Response> {
     return err(`Analysis unlocks after 10 rated songs (${ratedSongs.length}/10)`, 403)
   }
 
-  // Serve from cache if the rated-song count hasn't changed
+  // Serve from cache unless the rated-song count has crossed a new +5 bucket.
+  // (Resolved Design Decision #2(b): regenerating on every count change thrashes
+  // the cache mid-trip and re-bills Claude ≈11 calls each time. Bucketing by
+  // floor(count/5) means analysis refreshes at 10, 15, 20, … rated songs.)
   const cached = await getAnalysisCache(env.DB, trip.id)
-  if (cached && cached.rated_songs_count === ratedSongs.length) {
+  if (cached && Math.floor(cached.rated_songs_count / 5) === Math.floor(ratedSongs.length / 5)) {
     return new Response(cached.payload, { headers: { 'Content-Type': 'application/json' } })
   }
 
@@ -3313,17 +3338,17 @@ git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, v
 
 ---
 
-## Open Design Decisions (not yet resolved)
+## Resolved Design Decisions
 
-These are genuine product/architecture choices the critique surfaced. They are **not** bugs — each has a defensible default, but the call should be made deliberately before or during the relevant task.
+These product/architecture choices were surfaced by the critique and **resolved to their documented defaults on 2026-05-29**. They are **not** bugs — each was a deliberate call. Listed here so the rationale is recorded and not re-litigated mid-build.
 
-1. **Rating window (2 min) vs. song length / skips** (Task 6). `pollSpotify()` does `if (windowOpen) return`, so any track change is ignored while a rating window is open. Songs shorter than 2 minutes, or rapid skips, get dropped or misaligned (you rate a song that already ended). Options: (a) keep the loose party-game behavior (current); (b) shorten/dynamically size the window to the track's `duration_ms`; (c) close the window early when the track changes. **Default if undecided: (a).**
+1. **Rating window (2 min) vs. song length / skips** (Task 6) — **RESOLVED: (a) keep the loose party-game behavior.** `pollSpotify()` does `if (windowOpen) return`, so a track change is ignored while a rating window is open; songs shorter than 2 minutes or rapid skips get dropped or misaligned. Accepted: this is a party game, not a precise rating instrument, and the simplicity (time-based window, no playback coupling) is worth more than exact song alignment. Revisit only if users complain about missed/misaligned songs. (Rejected: (b) dynamic window sized to `duration_ms`, (c) close window early on track change.)
 
-2. **Analysis cache strategy** (analysis route). The cache key is the rated-song *count*, which keeps changing during active listening, so the cache rarely hits mid-trip — and each miss fires N personality + 1 group Claude calls (≈11 for 10 people), making the endpoint slow exactly when used. Options: (a) add a short TTL (e.g. regenerate at most every few minutes); (b) only regenerate when count crosses a threshold (every +5 songs); (c) accept current behavior since cost is low. **Default if undecided: (b).**
+2. **Analysis cache strategy** (analysis route) — **RESOLVED: (b) regenerate only when the count crosses a +5 bucket.** The original count-exact key thrashed the cache mid-trip, re-billing ≈11 Claude calls on every newly rated song. Now keyed on `Math.floor(ratedSongsCount / 5)`, so analysis refreshes at 10, 15, 20, … rated songs and serves cached in between. **Implemented** in the analysis route (Task 7). (Rejected: (a) time TTL — count-bucket is simpler and deterministic; (c) accept thrashing — too slow/costly exactly when the tab is used.)
 
-3. **DJ identification & OAuth auth** (Tasks 7/11). `isCreator` is a name string-match (`participantName === creatorName`), which breaks on duplicate names; and `/api/spotify/login` has no auth and the OAuth `state` is the plaintext `tripId` (no CSRF nonce) — anyone with a `tripId` can bind their own Spotify as the DJ. Options: (a) accept for a trusted-friends hobby app (current); (b) issue a creator secret/token at trip creation and require it for `login` + identify the creator by participant id, with a random `state`. **Default if undecided: (a), with a note to revisit if shared publicly.**
+3. **DJ identification & OAuth auth** (Tasks 7/11) — **RESOLVED: (a) accept name string-match + plaintext `tripId` state for a trusted-friends hobby app.** `isCreator` is `participantName === creatorName` (breaks on duplicate names) and `/api/spotify/login` has no auth with the `tripId` as a non-random OAuth `state` (anyone with a `tripId` could bind their own Spotify as DJ). Accepted for the intended audience (a handful of friends sharing a trip link). **Must revisit before any public/shared deployment** — option (b) (creator token issued at trip creation, participant-id identity, random `state` nonce) is the upgrade path.
 
-4. **`totalCount` from live sockets** (already noted as a known limitation) — a backgrounded/refreshing tab transiently drops the denominator. Acceptable for v1.
+4. **`totalCount` from live sockets** — **RESOLVED: accept for v1.** A backgrounded/refreshing tab transiently drops the denominator in the X/N counter. Cosmetic and self-healing on reconnect.
 
 ---
 
