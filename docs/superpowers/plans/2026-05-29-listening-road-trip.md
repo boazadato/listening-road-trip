@@ -1,12 +1,54 @@
 # Listening Road Trip Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Build a real-time road trip music rating web app where a DJ's Spotify playback auto-broadcasts to the group, everyone rates with emojis, and a leaderboard + AI taste analysis accumulate over the trip.
 
 **Architecture:** A single Cloudflare Worker serves the built React frontend as static assets plus all API routes. Each trip has a Durable Object that (a) holds WebSocket connections for all participants and (b) polls Spotify every 5 seconds via an alarm, broadcasting new songs and closing rating windows automatically. D1 (SQLite) persists trips, participants, songs, and ratings.
 
 **Tech Stack:** React + Vite (frontend), Cloudflare Workers + Durable Objects + D1 (backend), Spotify Web API (song detection + audio features), Claude API (personality generation), pnpm workspaces, TypeScript, Vitest
+
+---
+
+## Agent Session Protocol
+
+**This plan is designed for one-task-per-session execution.** Each Claude session picks up one task, completes it, and closes the GitHub issue.
+
+### Session Start
+
+1. Read `CLAUDE.md` — stack, Makefile commands, testing strategy, architecture notes
+2. Identify your task number (check open GitHub issues: `gh issue list --state open`)
+3. Read the full task section below including prerequisites, steps, and code
+4. Verify prerequisites: run the file-existence checks at the top of your task
+5. Run `pnpm install` from the repo root if `node_modules` are missing
+
+### Session End (every task)
+
+After the task's final commit:
+
+```bash
+git push
+gh issue close #N   # replace N with your task number
+```
+
+Then mark the task completed in the Claude Code task list (TaskUpdate → completed).
+
+### Working Directories
+
+All `make` and `gh` commands run from the **repo root**.
+Commands prefixed with `cd worker` run from `<root>/worker/`.
+Commands prefixed with `cd frontend` run from `<root>/frontend/`.
+
+### Local Dev Context
+
+- `wrangler dev --local` fully emulates Durable Objects, alarms, and D1 via Miniflare — no Cloudflare account needed
+- Tests run inside Miniflare via `@cloudflare/vitest-pool-workers` using the `SELF` binding for real HTTP calls
+- Frontend builds to `frontend-dist/` and is served as static assets by the Worker
+- Secrets (Spotify, Claude API key) are set via `wrangler secret put` — handled in Task 16
+- TDD loop: `cd worker && pnpm test --watch` re-runs on every file save
+
+### GitHub Issues
+
+Each task maps 1:1 to a GitHub issue at https://github.com/boazadato/listening-road-trip/issues
+Close your issue at session end with `gh issue close #N`.
 
 ---
 
@@ -64,6 +106,10 @@
 ---
 
 ## Task 1: Project Scaffold
+
+**GitHub issue:** #1 — close with `gh issue close 1` at session end
+
+**Prerequisites:** None — this is the first task. The repo root contains only `CLAUDE.md`, `Makefile`, `scripts/`, and `docs/`.
 
 **Files:**
 - Create: `package.json`
@@ -289,12 +335,19 @@ Copy the `database_id` from output into `wrangler.toml`.
 
 ```bash
 git add package.json wrangler.toml worker/ frontend/
-git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config"
+git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config" && git push && gh issue close 1
 ```
 
 ---
 
 ## Task 2: Types & D1 Schema
+
+**GitHub issue:** #2 — close with `gh issue close 2` at session end
+
+**Prerequisites:** Task 1 complete. Verify before starting:
+```bash
+ls package.json wrangler.toml worker/package.json frontend/package.json
+```
 
 **Files:**
 - Create: `worker/src/types.ts`
@@ -469,12 +522,19 @@ Expected: "Successfully executed 1 commands"
 
 ```bash
 git add worker/src/types.ts worker/schema.sql
-git commit -m "feat: types and D1 schema"
+git commit -m "feat: types and D1 schema" && git push && gh issue close 2
 ```
 
 ---
 
 ## Task 3: Utils & D1 Helpers
+
+**GitHub issue:** #3 — close with `gh issue close 3` at session end
+
+**Prerequisites:** Task 2 complete. Verify:
+```bash
+ls worker/src/types.ts worker/schema.sql
+```
 
 **Files:**
 - Create: `worker/src/utils.ts`
@@ -687,12 +747,19 @@ export async function getSongsWithRatings(db: D1Database, tripId: string): Promi
 
 ```bash
 git add worker/src/utils.ts worker/src/db.ts worker/test/
-git commit -m "feat: utils (id/code generation) and D1 typed query helpers"
+git commit -m "feat: utils (id/code generation) and D1 typed query helpers" && git push && gh issue close 3
 ```
 
 ---
 
 ## Task 4: Spotify Client
+
+**GitHub issue:** #4 — close with `gh issue close 4` at session end
+
+**Prerequisites:** Task 3 complete. Verify:
+```bash
+ls worker/src/utils.ts worker/src/db.ts worker/test/utils.test.ts
+```
 
 **Files:**
 - Create: `worker/src/spotify.ts`
@@ -858,12 +925,19 @@ Expected: PASS
 
 ```bash
 git add worker/src/spotify.ts worker/test/spotify.test.ts
-git commit -m "feat: Spotify client — token refresh, currently-playing, audio features"
+git commit -m "feat: Spotify client — token refresh, currently-playing, audio features" && git push && gh issue close 4
 ```
 
 ---
 
 ## Task 5: Claude Personality Generator
+
+**GitHub issue:** #5 — close with `gh issue close 5` at session end
+
+**Prerequisites:** Task 4 complete. Verify:
+```bash
+ls worker/src/spotify.ts worker/test/spotify.test.ts
+```
 
 **Files:**
 - Create: `worker/src/claude.ts`
@@ -971,12 +1045,19 @@ Respond in JSON: { "summary": "...", "topGenre": "...", "vibe": "..." }`
 
 ```bash
 git add worker/src/claude.ts
-git commit -m "feat: Claude API client for personality and group taste generation"
+git commit -m "feat: Claude API client for personality and group taste generation" && git push && gh issue close 5
 ```
 
 ---
 
 ## Task 6: Durable Object — WebSocket Hub
+
+**GitHub issue:** #6 — close with `gh issue close 6` at session end
+
+**Prerequisites:** Task 5 complete. Verify:
+```bash
+ls worker/src/claude.ts worker/src/spotify.ts worker/src/db.ts worker/src/utils.ts worker/src/types.ts
+```
 
 **Files:**
 - Create: `worker/src/TripRoom.ts`
@@ -1320,12 +1401,19 @@ export class TripRoom implements DurableObject {
 
 ```bash
 git add worker/src/TripRoom.ts
-git commit -m "feat: TripRoom Durable Object — WebSocket hub, Spotify polling, rating window"
+git commit -m "feat: TripRoom Durable Object — WebSocket hub, Spotify polling, rating window" && git push && gh issue close 6
 ```
 
 ---
 
 ## Task 7: Worker Entry Point & API Routes
+
+**GitHub issue:** #7 — close with `gh issue close 7` at session end
+
+**Prerequisites:** Task 6 complete. Verify:
+```bash
+ls worker/src/TripRoom.ts worker/src/claude.ts worker/src/spotify.ts worker/src/db.ts
+```
 
 **Files:**
 - Create: `worker/src/index.ts`
@@ -1674,12 +1762,20 @@ Expected: trip object returned.
 
 ```bash
 git add worker/src/index.ts worker/src/TripRoom.ts
-git commit -m "feat: Worker API routes — create/join trip, leaderboard, rating, analysis"
+git commit -m "feat: Worker API routes — create/join trip, leaderboard, rating, analysis" && git push && gh issue close 7
 ```
 
 ---
 
 ## Task 8: Frontend Types & Store
+
+**GitHub issue:** #8 — close with `gh issue close 8` at session end
+
+**Prerequisites:** Task 7 complete. Verify the Worker starts cleanly:
+```bash
+ls worker/src/index.ts
+cd worker && npx wrangler dev --local  # should start without errors, Ctrl+C to stop
+```
 
 **Files:**
 - Create: `frontend/src/types.ts`
@@ -1847,12 +1943,19 @@ export const useTripStore = create<TripStore>((set) => ({
 
 ```bash
 git add frontend/src/types.ts frontend/src/hooks/useTripStore.ts
-git commit -m "feat: frontend types and Zustand trip store"
+git commit -m "feat: frontend types and Zustand trip store" && git push && gh issue close 8
 ```
 
 ---
 
 ## Task 9: WebSocket Hook
+
+**GitHub issue:** #9 — close with `gh issue close 9` at session end
+
+**Prerequisites:** Task 8 complete. Verify:
+```bash
+ls frontend/src/types.ts frontend/src/hooks/useTripStore.ts
+```
 
 **Files:**
 - Create: `frontend/src/hooks/useWebSocket.ts`
@@ -1943,12 +2046,19 @@ export function useWebSocket(tripId: string | null, participantId: string | null
 
 ```bash
 git add frontend/src/hooks/useWebSocket.ts
-git commit -m "feat: WebSocket hook with auto-reconnect and message dispatch"
+git commit -m "feat: WebSocket hook with auto-reconnect and message dispatch" && git push && gh issue close 9
 ```
 
 ---
 
 ## Task 10: Home Page — Create & Join Forms
+
+**GitHub issue:** #10 — close with `gh issue close 10` at session end
+
+**Prerequisites:** Task 9 complete. Verify:
+```bash
+ls frontend/src/hooks/useWebSocket.ts frontend/src/hooks/useTripStore.ts frontend/src/types.ts
+```
 
 **Files:**
 - Create: `frontend/src/main.tsx`
@@ -2233,12 +2343,19 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
 
 ```bash
 git add frontend/src/
-git commit -m "feat: Home page with create/join trip forms"
+git commit -m "feat: Home page with create/join trip forms" && git push && gh issue close 10
 ```
 
 ---
 
 ## Task 11: Trip Page — Layout, Tabs & WebSocket
+
+**GitHub issue:** #11 — close with `gh issue close 11` at session end
+
+**Prerequisites:** Task 10 complete. Verify:
+```bash
+ls frontend/src/main.tsx frontend/src/App.tsx frontend/src/pages/Home.tsx frontend/src/components/CreateTripForm.tsx
+```
 
 **Files:**
 - Create: `frontend/src/pages/Trip.tsx`
@@ -2450,12 +2567,19 @@ export default function QRCodeModal({ code, onClose }: Props) {
 
 ```bash
 git add frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx
-git commit -m "feat: Trip page with tab layout, reconnect toast, QR share modal"
+git commit -m "feat: Trip page with tab layout, reconnect toast, QR share modal" && git push && gh issue close 11
 ```
 
 ---
 
 ## Task 12: Current Song Tab
+
+**GitHub issue:** #12 — close with `gh issue close 12` at session end
+
+**Prerequisites:** Task 11 complete. Verify:
+```bash
+ls frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx
+```
 
 **Files:**
 - Create: `frontend/src/components/CurrentSong.tsx`
@@ -2703,12 +2827,19 @@ export default function CurrentSong({ onRate }: Props) {
 
 ```bash
 git add frontend/src/components/
-git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown timer, reveal"
+git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown timer, reveal" && git push && gh issue close 12
 ```
 
 ---
 
 ## Task 13: Leaderboard Tab
+
+**GitHub issue:** #13 — close with `gh issue close 13` at session end
+
+**Prerequisites:** Task 12 complete. Verify:
+```bash
+ls frontend/src/components/CurrentSong.tsx frontend/src/components/RatingButtons.tsx frontend/src/components/CountdownTimer.tsx
+```
 
 **Files:**
 - Create: `frontend/src/components/Leaderboard.tsx`
@@ -2796,12 +2927,21 @@ export default function Leaderboard({ code }: Props) {
 
 ```bash
 git add frontend/src/components/Leaderboard.tsx
-git commit -m "feat: Leaderboard tab with hall of shame styling"
+git commit -m "feat: Leaderboard tab with hall of shame styling" && git push && gh issue close 13
 ```
 
 ---
 
 ## Task 14: Analysis Tab
+
+**GitHub issue:** #14 — close with `gh issue close 14` at session end
+
+**Prerequisites:** Task 13 complete. Verify:
+```bash
+ls frontend/src/components/Leaderboard.tsx
+# Also verify the GET /api/trips/:code/analysis endpoint works:
+# (requires wrangler dev --local running, a trip with 10+ rated songs)
+```
 
 **Files:**
 - Create: `frontend/src/components/Analysis.tsx`
@@ -2897,12 +3037,20 @@ function Tag({ label }: { label: string }) {
 
 ```bash
 git add frontend/src/components/Analysis.tsx
-git commit -m "feat: Analysis tab — group taste summary and Claude personality cards"
+git commit -m "feat: Analysis tab — group taste summary and Claude personality cards" && git push && gh issue close 14
 ```
 
 ---
 
 ## Task 15: Build & Local Integration Test
+
+**GitHub issue:** #15 — close with `gh issue close 15` at session end
+
+**Prerequisites:** Tasks 1–14 complete. The full stack is implemented. Verify:
+```bash
+ls frontend/src/components/Analysis.tsx frontend/src/components/Leaderboard.tsx frontend/src/pages/Trip.tsx worker/src/index.ts worker/src/TripRoom.ts
+pnpm install  # ensure deps are installed
+```
 
 **Files:**
 - No new files — verify everything wires together
@@ -2966,12 +3114,19 @@ Click an emoji in the browser. Confirm `rating_update` broadcasts in DevTools WS
 - [ ] **Step 9: Commit**
 
 ```bash
-git commit -m "chore: local integration verified — trip create, join, song push, rating"
+git commit -m "chore: local integration verified — trip create, join, song push, rating" && git push && gh issue close 15
 ```
 
 ---
 
-## Task 16: Spotify Polling Integration & Setup Script
+## Task 16: Spotify Token Setup Script
+
+**GitHub issue:** #16 — close with `gh issue close 16` at session end
+
+**Prerequisites:** Task 15 complete — integration test passes locally. Verify:
+```bash
+ls scripts/get-spotify-token.mjs 2>/dev/null || echo "needs creating"
+```
 
 **Files:**
 - Create: `scripts/get-spotify-token.mjs`
@@ -3038,12 +3193,22 @@ server.listen(PORT, () => console.log(`Listening on http://localhost:${PORT}`))
 
 ```bash
 git add scripts/get-spotify-token.mjs
-git commit -m "feat: one-time Spotify OAuth script to get refresh token"
+git commit -m "feat: one-time Spotify OAuth script to get refresh token" && git push && gh issue close 16
 ```
 
 ---
 
 ## Task 17: Deploy to Cloudflare
+
+**GitHub issue:** #17 — close with `gh issue close 17` at session end
+
+**Prerequisites:** Task 16 complete. Secrets must be set before deploy:
+```bash
+# Verify secrets exist (wrangler will error on deploy if missing)
+npx wrangler secret list  # should list SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN, CLAUDE_API_KEY
+# If any are missing, run: node scripts/get-spotify-token.mjs (needs SPOTIFY_CLIENT_ID + SECRET in env)
+# Then: npx wrangler secret put <NAME>
+```
 
 - [ ] **Step 1: Build frontend**
 
@@ -3091,7 +3256,7 @@ curl https://listening-road-trip.<your-account>.workers.dev/api/trips \
 - [ ] **Step 7: Commit**
 
 ```bash
-git commit -m "chore: production deployment verified"
+git commit -m "chore: production deployment verified" && git push && gh issue close 17
 ```
 
 ---
