@@ -20,36 +20,41 @@ This plan was rewritten after a critical review of the first draft. Key correcti
 4. **Fixes:** single-JOIN leaderboard query (no N+1), cached analysis (no Claude re-billing on every tab open), `.gitignore`, deferred `wrangler d1 create` to deploy, wrangler v4 + current compat date, hardened `parseCurrentlyPlaying` (skips ads/podcasts), removed build-breaking unused `ctx`, dropped unnecessary CORS (same-origin).
 5. **Tests:** added an API integration test task (`SELF` binding) + key frontend behavior tests, per CLAUDE.md's "API tests are primary" strategy.
 
-> **GitHub issues need re-syncing.** The task set changed (Task 16 is now Playwright E2E; the old token-script task is gone; Spotify OAuth setup folded into Task 17). Re-title/close issues to match before running sessions.
+### Revision Note 2 (2026-05-29, post-critique pass)
+
+A second review found deploy-blockers and bugs that an agent would hit executing v2 verbatim. Fixed in place (Cloudflare claims verified against current docs; Spotify claims verified against current Spotify policy):
+
+1. **`new_sqlite_classes`, not `new_classes`** (Task 1) — Cloudflare recommends the SQLite DO backend for all new classes and the choice is **irreversible**. KV-backed would lock us in permanently.
+2. **SPA fallback** (Task 1) — added `not_found_handling = "single-page-application"` + `run_worker_first`. Without it, `/trip/:code` and the **OAuth redirect landing** 404 in prod.
+3. **Test D1 had no schema** (Task 1/15) — added `worker/test/apply-schema.ts` setup file that applies `schema.sql` to the isolated test DB. The primary (`SELF`) test suite would otherwise fail with `no such table`.
+4. **pnpm workspace misconfigured** (Task 1) — pnpm needs `pnpm-workspace.yaml`; the `workspaces` key in `package.json` is ignored by pnpm, so `pnpm install` linked nothing.
+5. **Frontend `res.json<T>()`** (Tasks 10–14) — the typed generic is Workers-only; browser DOM `Response.json()` takes no type arg. Switched to `(await res.json()) as T`, or `tsc` fails.
+6. **Alarm never stopped** (Task 6) — the 5s Spotify poll rescheduled forever even with zero participants; now stops when no sockets are connected and resumes on reconnect (DO duration billing is live in 2026).
+7. **Spotify OAuth reality** (Tasks 4/17) — HTTPS-only redirect URIs (no `http://localhost`), dev-mode capped at 5 Premium users, no extended-quota path for individuals. Added a pre-Task-4 spike (`scripts/spotify-spike.mjs`) to validate the live API contract.
+
+Design tensions surfaced but **left as explicit decisions** (see "Open Design Decisions" near the end): rating-window vs. song length, analysis cache strategy, and DJ identification/OAuth auth.
 
 ---
 
 ## Agent Session Protocol
 
-**This plan is designed for one-task-per-session execution.** Each Claude session picks up one task, completes it, and closes the GitHub issue.
+**This plan is designed for one-task-per-session execution.** Each Claude session picks up one task and completes it. This plan is the single source of truth for the task list — there is no separate issue tracker.
 
 ### Session Start
 
 1. Read `CLAUDE.md` — stack, Makefile commands, testing strategy, architecture notes
-2. Identify your task (check open GitHub issues: `gh issue list --state open` — each issue title starts with `Task N:`). **Note:** GitHub issue numbers are NOT the same as task numbers (they were created out of order); use the exact `gh issue close <#>` command printed in your task header.
+2. Identify the next task: the lowest-numbered task below whose final commit isn't yet in `git log` (`git log --oneline` — each task's commit message is in its final step). Tasks are ordered by dependency; do them in order.
 3. Read the full task section below including prerequisites, steps, and code
 4. Verify prerequisites: run the file-existence checks at the top of your task
 5. Run `pnpm install` from the repo root if `node_modules` are missing
 
 ### Session End (every task)
 
-After the task's final commit:
-
-```bash
-git push
-gh issue close <#>   # use the issue number from YOUR task header (≠ task number)
-```
-
-Then mark the task completed in the Claude Code task list (TaskUpdate → completed).
+After the task's final commit, `git push`, then mark the task completed in the Claude Code task list (TaskUpdate → completed).
 
 ### Working Directories
 
-All `make` and `gh` commands run from the **repo root**.
+All `make` commands run from the **repo root**.
 Commands prefixed with `cd worker` run from `<root>/worker/`.
 Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 
@@ -70,10 +75,11 @@ Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 ├── .gitignore
 ├── wrangler.toml                        # Cloudflare config (assets, DO, D1)
 ├── package.json                         # pnpm workspace root
+├── pnpm-workspace.yaml                  # pnpm workspace members (required by pnpm)
 ├── worker/
 │   ├── package.json
 │   ├── tsconfig.json
-│   ├── schema.sql                       # D1 schema (source of truth)
+│   ├── schema.sql                       # D1 schema (source of truth; applied in tests too)
 │   ├── vitest.config.ts
 │   ├── .dev.vars                        # local secrets (gitignored)
 │   └── src/
@@ -85,6 +91,7 @@ Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 │       ├── types.ts                     # Shared types (WS messages, DB rows, API payloads)
 │       └── utils.ts                     # Short code / id generation, response helpers
 │   └── test/
+│       ├── apply-schema.ts              # vitest setupFile — applies schema.sql to the test D1
 │       ├── api.test.ts                  # Integration tests (SELF binding) — primary
 │       ├── spotify.test.ts
 │       └── utils.test.ts
@@ -126,22 +133,23 @@ Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 
 ## Task 1: Project Scaffold
 
-**GitHub issue:** #1 — close with `gh issue close 1` at session end
-
 **Prerequisites:** None — this is the first task. The repo root contains only `CLAUDE.md`, `Makefile`, `scripts/`, and `docs/`.
 
 **Files:**
 - Create: `.gitignore`
 - Create: `package.json`
+- Create: `pnpm-workspace.yaml`
 - Create: `wrangler.toml`
 - Create: `worker/package.json`
 - Create: `worker/tsconfig.json`
 - Create: `worker/vitest.config.ts`
+- Create: `worker/test/apply-schema.ts`
 - Create: `worker/.dev.vars`
 - Create: `frontend/package.json`
 - Create: `frontend/tsconfig.json`
 - Create: `frontend/vite.config.ts`
 - Create: `frontend/vitest.config.ts`
+- Create: `frontend/src/test-setup.ts`
 - Create: `frontend/index.html`
 
 - [ ] **Step 1: Create `.gitignore`**
@@ -159,14 +167,22 @@ dist/
 
 - [ ] **Step 2: Create pnpm workspace root**
 
+> pnpm reads workspace members from `pnpm-workspace.yaml`, **not** the `workspaces` field in `package.json` (that field is npm/yarn-only and pnpm ignores it). Without the YAML file, `pnpm install` won't link `worker/` and `frontend/` and `make dev`/`make test` fail at step one. Create both files.
+
 ```json
 // package.json
 {
   "name": "listening-road-trip",
   "private": true,
-  "packageManager": "pnpm@9.0.0",
-  "workspaces": ["worker", "frontend"]
+  "packageManager": "pnpm@9.0.0"
 }
+```
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - worker
+  - frontend
 ```
 
 - [ ] **Step 3: Create worker package**
@@ -212,20 +228,66 @@ We use the Claude and Spotify APIs via raw `fetch` — no SDK dependency.
 }
 ```
 
+The test D1 starts empty — nothing creates the tables — so without this the `SELF` integration tests fail with `no such table: trips`. We read `schema.sql` at config time (Node context, where `fs` is available), split it into statements, and pass them as a test-only binding that a setup file applies before each test file. This keeps `schema.sql` the single source of truth (no separate migrations dir).
+
 ```typescript
 // worker/vitest.config.ts
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config'
+
+const schema = readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8')
+// Split into individual statements (statements end with ';'; no ';' appears inside our schema).
+// Strip `--` comment lines *within* each chunk first — a leading comment must not cause the
+// statement after it to be dropped (e.g. the comment above `analysis_cache`).
+const schemaStatements = schema
+  .split(';')
+  .map(chunk =>
+    chunk
+      .split('\n')
+      .filter(line => !line.trim().startsWith('--'))
+      .join('\n')
+      .trim()
+  )
+  .filter(s => s.length > 0)
 
 export default defineWorkersConfig({
   test: {
+    setupFiles: ['./test/apply-schema.ts'],
     poolOptions: {
       workers: {
         wrangler: { configPath: '../wrangler.toml' },
+        miniflare: {
+          bindings: { TEST_SCHEMA_STATEMENTS: schemaStatements },
+        },
       },
     },
   },
 })
 ```
+
+```typescript
+// worker/test/apply-schema.ts
+// Runs once per test file (vitest setupFile) — recreates the schema in the isolated test D1.
+import { env } from 'cloudflare:test'
+import { beforeAll } from 'vitest'
+import type { Env } from '../src/types'
+
+declare module 'cloudflare:test' {
+  // Extends the worker Env so env.DB (and friends) are typed, plus our test-only binding.
+  interface ProvidedEnv extends Env {
+    TEST_SCHEMA_STATEMENTS: string[]
+  }
+}
+
+beforeAll(async () => {
+  for (const stmt of env.TEST_SCHEMA_STATEMENTS) {
+    await env.DB.prepare(stmt).run()
+  }
+})
+```
+
+> `schema.sql` uses `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so re-applying per test file is idempotent. This file is referenced by `vitest.config.ts` above, so it must exist from Task 1 onward — otherwise the Task 3/4 unit tests fail to load the setup file.
 
 ```
 # worker/.dev.vars  (gitignored — local secrets for `wrangler dev`)
@@ -352,6 +414,11 @@ import '@testing-library/jest-dom/vitest'
 
 The `database_id` is a placeholder for local dev (Miniflare ignores it). The real id is created and filled in at deploy (Task 17). The Spotify redirect URI is derived from the request origin at runtime — no config needed here.
 
+Three settings here are load-bearing and were wrong/missing in the prior draft (verified against current Cloudflare docs):
+- **`not_found_handling = "single-page-application"`** — without it, deep links like `/trip/:code` and the **Spotify OAuth redirect landing** (`spotifyCallback` redirects to `/trip/<code>`) return a 404 in production. This breaks the core creator flow.
+- **`run_worker_first`** — routes `/api/*` and `/ws` to the Worker (not static assets), while everything else falls through to the SPA. (Asset files like `/assets/*` are still served directly.)
+- **`new_sqlite_classes`** (not `new_classes`) — Cloudflare recommends the SQLite storage backend for all new Durable Object classes, and **the choice is irreversible** ("you cannot enable a SQLite storage backend on an existing, deployed Durable Object class"). KV-backed `new_classes` would lock us into the legacy backend permanently. The DO uses the KV-style `ctx.storage.get/put` API, which works on the SQLite backend too — no code change needed.
+
 ```toml
 # wrangler.toml
 name = "listening-road-trip"
@@ -362,6 +429,8 @@ compatibility_flags = ["nodejs_compat"]
 [assets]
 directory = "./frontend-dist"
 binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/ws"]
 
 [[durable_objects.bindings]]
 name = "TRIP_ROOM"
@@ -369,7 +438,7 @@ class_name = "TripRoom"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["TripRoom"]
+new_sqlite_classes = ["TripRoom"]
 
 [[d1_databases]]
 binding = "DB"
@@ -396,15 +465,13 @@ Expected: packages installed in `worker/node_modules` and `frontend/node_modules
 - [ ] **Step 7: Commit**
 
 ```bash
-git add .gitignore package.json wrangler.toml worker/ frontend/
-git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config" && git push && gh issue close 1
+git add .gitignore package.json pnpm-workspace.yaml wrangler.toml worker/ frontend/
+git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config" && git push
 ```
 
 ---
 
 ## Task 2: Types & D1 Schema
-
-**GitHub issue:** #3 — close with `gh issue close 3` at session end
 
 **Prerequisites:** Task 1 complete. Verify:
 ```bash
@@ -585,14 +652,12 @@ Expected: "Successfully executed N commands"
 
 ```bash
 git add worker/src/types.ts worker/schema.sql
-git commit -m "feat: types and D1 schema (per-trip token, analysis cache, no audio features)" && git push && gh issue close 3
+git commit -m "feat: types and D1 schema (per-trip token, analysis cache, no audio features)" && git push
 ```
 
 ---
 
 ## Task 3: Utils & D1 Helpers
-
-**GitHub issue:** #6 — close with `gh issue close 6` at session end
 
 **Prerequisites:** Task 2 complete. Verify:
 ```bash
@@ -863,14 +928,12 @@ export async function setAnalysisCache(
 
 ```bash
 git add worker/src/utils.ts worker/src/db.ts worker/test/
-git commit -m "feat: utils and D1 helpers — per-trip token, single-JOIN leaderboard, analysis cache" && git push && gh issue close 6
+git commit -m "feat: utils and D1 helpers — per-trip token, single-JOIN leaderboard, analysis cache" && git push
 ```
 
 ---
 
 ## Task 4: Spotify Client
-
-**GitHub issue:** #5 — close with `gh issue close 5` at session end
 
 **Prerequisites:** Task 3 complete. Verify:
 ```bash
@@ -880,6 +943,8 @@ ls worker/src/utils.ts worker/src/db.ts worker/test/utils.test.ts
 **Files:**
 - Create: `worker/src/spotify.ts`
 - Create: `worker/test/spotify.test.ts`
+
+> **Validate the Spotify contract first.** Spotify is the highest-risk, least-mockable part of this app. Before implementing, run `scripts/spotify-spike.mjs` (see its header) against a real account to confirm: the `currently-playing` JSON shape `parseCurrentlyPlaying` assumes, the `204`/ad/podcast edge cases, and that the refresh token does not rotate. Fix the parser/types to match reality, then write the tests below to lock it in. (Requires a registered Spotify app with an HTTPS redirect URI and your account on the dev-mode allowlist — see Task 17.)
 
 Note: `audio-features` is **not** implemented — Spotify deprecated it for apps created after 2024-11-27. Taste analysis infers genre/vibe from titles/artists/scores (Task 5).
 
@@ -918,7 +983,7 @@ describe('exchangeCodeForToken', () => {
         headers: { 'Content-Type': 'application/json' },
       })
     )
-    const tokens = await exchangeCodeForToken('id', 'secret', 'the_code', 'http://localhost:8787/api/spotify/callback', mockFetch)
+    const tokens = await exchangeCodeForToken('id', 'secret', 'the_code', 'https://example.workers.dev/api/spotify/callback', mockFetch)
     expect(tokens.refresh_token).toBe('r')
   })
 })
@@ -1055,14 +1120,12 @@ Expected: PASS
 
 ```bash
 git add worker/src/spotify.ts worker/test/spotify.test.ts
-git commit -m "feat: Spotify client — token refresh, OAuth code exchange, hardened currently-playing" && git push && gh issue close 5
+git commit -m "feat: Spotify client — token refresh, OAuth code exchange, hardened currently-playing" && git push
 ```
 
 ---
 
 ## Task 5: Claude Taste Generator
-
-**GitHub issue:** #7 — close with `gh issue close 7` at session end
 
 **Prerequisites:** Task 4 complete. Verify:
 ```bash
@@ -1168,14 +1231,12 @@ Respond in JSON: { "summary": "...", "topGenre": "...", "vibe": "..." }`
 
 ```bash
 git add worker/src/claude.ts
-git commit -m "feat: Claude client — personality + group taste inferred from titles/artists/scores" && git push && gh issue close 7
+git commit -m "feat: Claude client — personality + group taste inferred from titles/artists/scores" && git push
 ```
 
 ---
 
 ## Task 6: Durable Object — WebSocket Hub + Direct D1 Writes
-
-**GitHub issue:** #4 — close with `gh issue close 4` at session end
 
 **Prerequisites:** Task 5 complete. Verify:
 ```bash
@@ -1346,6 +1407,14 @@ export class TripRoom implements DurableObject {
     if (windowEndsAt && Date.now() >= windowEndsAt) {
       await this.revealRatings()
     }
+
+    // Stop the poll loop when nobody is connected. Otherwise every trip's DO polls
+    // Spotify every 5s forever, never meaningfully hibernates, and accrues duration
+    // cost indefinitely (SQLite-backed DO storage + duration billing is live as of 2026).
+    // Ratings are already persisted to D1, so there's nothing to lose by pausing.
+    // Polling resumes via ensurePolling() the next time a participant connects.
+    if (this.ctx.getWebSockets().length === 0) return
+
     try {
       await this.pollSpotify()
     } catch (e) {
@@ -1497,14 +1566,12 @@ export class TripRoom implements DurableObject {
 
 ```bash
 git add worker/src/TripRoom.ts
-git commit -m "feat: TripRoom DO — WS hub, Spotify polling, direct D1 song/rating writes" && git push && gh issue close 4
+git commit -m "feat: TripRoom DO — WS hub, Spotify polling, direct D1 song/rating writes" && git push
 ```
 
 ---
 
 ## Task 7: Worker Entry Point, API Routes & Spotify OAuth
-
-**GitHub issue:** #2 — close with `gh issue close 2` at session end
 
 **Prerequisites:** Task 6 complete. Verify:
 ```bash
@@ -1757,14 +1824,12 @@ Expected: `{"trip":{"id":"...","short_code":"XXXXXX",...}}`. Then `curl http://l
 
 ```bash
 git add worker/src/index.ts
-git commit -m "feat: Worker routes — trips, leaderboard, cached analysis, Spotify OAuth, WS upgrade" && git push && gh issue close 2
+git commit -m "feat: Worker routes — trips, leaderboard, cached analysis, Spotify OAuth, WS upgrade" && git push
 ```
 
 ---
 
 ## Task 8: Frontend Types & Store
-
-**GitHub issue:** #8 — close with `gh issue close 8` at session end
 
 **Prerequisites:** Task 7 complete. Verify the Worker starts cleanly:
 ```bash
@@ -1937,14 +2002,12 @@ export const useTripStore = create<TripStore>((set) => ({
 
 ```bash
 git add frontend/src/types.ts frontend/src/hooks/useTripStore.ts
-git commit -m "feat: frontend types and Zustand trip store (djConnected, lastReveal)" && git push && gh issue close 8
+git commit -m "feat: frontend types and Zustand trip store (djConnected, lastReveal)" && git push
 ```
 
 ---
 
 ## Task 9: WebSocket Hook
-
-**GitHub issue:** #9 — close with `gh issue close 9` at session end
 
 **Prerequisites:** Task 8 complete. Verify:
 ```bash
@@ -2030,14 +2093,12 @@ export function useWebSocket(tripId: string | null, participantId: string | null
 
 ```bash
 git add frontend/src/hooks/useWebSocket.ts
-git commit -m "feat: WebSocket hook with reactive connection state and auto-reconnect" && git push && gh issue close 9
+git commit -m "feat: WebSocket hook with reactive connection state and auto-reconnect" && git push
 ```
 
 ---
 
 ## Task 10: Home Page — Create & Join Forms
-
-**GitHub issue:** #16 — close with `gh issue close 16` at session end
 
 **Prerequisites:** Task 9 complete. Verify:
 ```bash
@@ -2053,6 +2114,8 @@ ls frontend/src/hooks/useWebSocket.ts frontend/src/hooks/useTripStore.ts fronten
 - Create: `frontend/src/components/JoinTripForm.tsx`
 
 After creating a trip, the creator's browser is sent to `/api/spotify/login` (full-page redirect for OAuth). Identity is saved to `sessionStorage` first so it survives the round-trip; the Trip page restores it after Spotify redirects back.
+
+> **Frontend fetch typing:** the browser's DOM `Response.json()` takes no type argument (unlike the Workers `Response.json<T>()`), so all frontend fetch calls use `(await res.json()) as T` (or `r.json() as Promise<T>` in `.then` chains). Using `res.json<T>()` on the frontend fails `tsc`.
 
 - [ ] **Step 1: Create app entry and router**
 
@@ -2207,7 +2270,7 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: tripName.trim(), creatorName: yourName.trim() }),
       })
-      const data = await res.json<{ trip: { id: string; short_code: string } }>()
+      const data = (await res.json()) as { trip: { id: string; short_code: string } }
 
       // Auto-join as creator
       const joinRes = await fetch(`/api/trips/${data.trip.short_code}/join`, {
@@ -2215,7 +2278,7 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: yourName.trim() }),
       })
-      const joinData = await joinRes.json<{ participant: { id: string } }>()
+      const joinData = (await joinRes.json()) as { participant: { id: string } }
 
       onCreated(joinData.participant.id, yourName.trim(), data.trip.short_code, data.trip.id)
     } catch {
@@ -2276,12 +2339,12 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
         body: JSON.stringify({ name: yourName.trim() }),
       })
       if (!res.ok) {
-        const data = await res.json<{ error: string }>()
+        const data = (await res.json()) as { error: string }
         setError(data.error ?? 'Failed to join')
         setLoading(false)
         return
       }
-      const data = await res.json<{ participant: { id: string } }>()
+      const data = (await res.json()) as { participant: { id: string } }
       onJoined(data.participant.id, yourName.trim(), code.trim().toUpperCase())
     } catch {
       setError('Failed to join trip. Check the code.')
@@ -2319,14 +2382,12 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
 
 ```bash
 git add frontend/src/
-git commit -m "feat: Home page — create (→ Spotify OAuth) and join forms" && git push && gh issue close 16
+git commit -m "feat: Home page — create (→ Spotify OAuth) and join forms" && git push
 ```
 
 ---
 
 ## Task 11: Trip Page — Layout, Tabs, WebSocket & DJ Connect
-
-**GitHub issue:** #10 — close with `gh issue close 10` at session end
 
 **Prerequisites:** Task 10 complete. Verify:
 ```bash
@@ -2384,7 +2445,7 @@ export default function Trip() {
   useEffect(() => {
     if (!code) return
     fetch(`/api/trips/${code}`)
-      .then(r => r.json<{ trip: { id: string; name: string; short_code: string; creator_name: string; djConnected: boolean } }>())
+      .then(r => r.json() as Promise<{ trip: { id: string; name: string; short_code: string; creator_name: string; djConnected: boolean } }>)
       .then(({ trip }) => {
         setCreatorName(trip.creator_name)
         const s = useTripStore.getState()
@@ -2402,7 +2463,7 @@ export default function Trip() {
   useEffect(() => {
     if (!code) return
     fetch(`/api/trips/${code}/leaderboard`)
-      .then(r => r.json<{ songs: unknown[] }>())
+      .then(r => r.json() as Promise<{ songs: unknown[] }>)
       .then(d => setAnalysisUnlocked(d.songs.length >= 10))
       .catch(() => {})
   }, [code])
@@ -2542,14 +2603,12 @@ export default function ConnectSpotify({ tripId, isCreator, creatorName }: Props
 
 ```bash
 git add frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx frontend/src/components/ConnectSpotify.tsx
-git commit -m "feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt" && git push && gh issue close 10
+git commit -m "feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt" && git push
 ```
 
 ---
 
 ## Task 12: Current Song Tab
-
-**GitHub issue:** #13 — close with `gh issue close 13` at session end
 
 **Prerequisites:** Task 11 complete. Verify:
 ```bash
@@ -2769,14 +2828,12 @@ export default function CurrentSong({ onRate }: Props) {
 
 ```bash
 git add frontend/src/components/
-git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown, reveal" && git push && gh issue close 13
+git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown, reveal" && git push
 ```
 
 ---
 
 ## Task 13: Leaderboard Tab
-
-**GitHub issue:** #17 — close with `gh issue close 17` at session end
 
 **Prerequisites:** Task 12 complete. Verify:
 ```bash
@@ -2803,7 +2860,7 @@ export default function Leaderboard({ code }: Props) {
   useEffect(() => {
     const load = () =>
       fetch(`/api/trips/${code}/leaderboard`)
-        .then(r => r.json<{ songs: LeaderboardEntry[] }>())
+        .then(r => r.json() as Promise<{ songs: LeaderboardEntry[] }>)
         .then(d => { setSongs(d.songs); setLoading(false) })
         .catch(() => setLoading(false))
     load()
@@ -2859,14 +2916,12 @@ export default function Leaderboard({ code }: Props) {
 
 ```bash
 git add frontend/src/components/Leaderboard.tsx
-git commit -m "feat: Leaderboard tab with hall of shame styling" && git push && gh issue close 17
+git commit -m "feat: Leaderboard tab with hall of shame styling" && git push
 ```
 
 ---
 
 ## Task 14: Analysis Tab
-
-**GitHub issue:** #15 — close with `gh issue close 15` at session end
 
 **Prerequisites:** Task 13 complete. Verify:
 ```bash
@@ -2900,12 +2955,12 @@ export default function Analysis({ code }: Props) {
     fetch(`/api/trips/${code}/analysis`)
       .then(async r => {
         if (!r.ok) {
-          const e = await r.json<{ error: string }>()
+          const e = (await r.json()) as { error: string }
           setError(e.error)
           setLoading(false)
           return
         }
-        setData(await r.json<AnalysisData>())
+        setData((await r.json()) as AnalysisData)
         setLoading(false)
       })
       .catch(() => { setError('Failed to load analysis'); setLoading(false) })
@@ -2958,14 +3013,12 @@ function Tag({ label }: { label: string }) {
 
 ```bash
 git add frontend/src/components/Analysis.tsx
-git commit -m "feat: Analysis tab — group taste summary and Claude personality cards" && git push && gh issue close 15
+git commit -m "feat: Analysis tab — group taste summary and Claude personality cards" && git push
 ```
 
 ---
 
 ## Task 15: API Integration & Frontend Behavior Tests
-
-**GitHub issue:** #11 — close with `gh issue close 11` at session end
 
 **Prerequisites:** Tasks 1–14 complete. Verify:
 ```bash
@@ -3137,14 +3190,12 @@ Expected: all PASS, no type errors.
 
 ```bash
 git add worker/test/api.test.ts frontend/src/components/__tests__ frontend/src/hooks/__tests__
-git commit -m "test: API integration (SELF) + frontend behavior tests" && git push && gh issue close 11
+git commit -m "test: API integration (SELF) + frontend behavior tests" && git push
 ```
 
 ---
 
 ## Task 16: Build & Playwright E2E (Golden Path)
-
-**GitHub issue:** #12 — close with `gh issue close 12` at session end
 
 **Prerequisites:** Task 15 complete. Verify:
 ```bash
@@ -3188,14 +3239,12 @@ With a Spotify track playing on the connected account, confirm within ~10s a `so
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit --allow-empty -m "chore: E2E golden path verified via Playwright MCP" && git push && gh issue close 12
+git commit --allow-empty -m "chore: E2E golden path verified via Playwright MCP" && git push
 ```
 
 ---
 
 ## Task 17: Spotify App Setup & Deploy to Cloudflare
-
-**GitHub issue:** #14 — close with `gh issue close 14` at session end
 
 **Prerequisites:** Task 16 complete. You need a Cloudflare account and a Spotify Developer app.
 
@@ -3204,11 +3253,15 @@ git commit --allow-empty -m "chore: E2E golden path verified via Playwright MCP"
 
 - [ ] **Step 1: Register the Spotify app**
 
-In the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), create an app and add **both** redirect URIs:
-- `http://localhost:8787/api/spotify/callback` (local)
-- `https://listening-road-trip.<your-account>.workers.dev/api/spotify/callback` (prod)
+In the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), create an app.
 
-Note the Client ID and Client Secret.
+> **Spotify OAuth rules changed (verified May 2026) — these are hard constraints, not preferences:**
+> - **Redirect URIs must be HTTPS.** Spotify's OAuth migration (enforced 27 Nov 2025, auto-applied to any app created after 9 Apr 2025) **removed support for `http://` and `localhost` redirect URIs entirely** — even loopback now requires HTTPS. So a plain `http://localhost:8787/...` callback is rejected.
+>   - **Prod:** `https://listening-road-trip.<your-account>.workers.dev/api/spotify/callback`
+>   - **Local dev:** you cannot use `http://localhost`. Either (a) test OAuth only against the deployed HTTPS worker, or (b) run an HTTPS tunnel — e.g. `cloudflared tunnel --url http://localhost:8787` — and register that tunnel's `https://…/api/spotify/callback` URL. (See `scripts/spotify-spike.mjs` for a token-only spike that needs no local server.)
+> - **Dev-mode user allowlist (5 users, Premium required).** New apps start in *Development Mode*: only Spotify accounts you explicitly add under **User Management** can complete OAuth, now capped at **5 users** (down from 25), and the developer account needs **Spotify Premium**. Since only the *DJ* authorizes, add each DJ's Spotify email here. There is effectively **no path to Extended Quota** for an individual (it now requires a registered business + 250k MAU), so this app is permanently limited to ≤5 DJ accounts and cannot be opened to the public.
+
+Add the redirect URI(s) you'll actually use (prod, and a tunnel URL if testing OAuth locally), add your DJ account email(s) under User Management, and note the Client ID and Client Secret.
 
 - [ ] **Step 2: Create the production D1 database**
 
@@ -3255,8 +3308,22 @@ Expected output includes `https://listening-road-trip.<your-account>.workers.dev
 
 ```bash
 git add wrangler.toml
-git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, verified" && git push && gh issue close 14
+git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, verified" && git push
 ```
+
+---
+
+## Open Design Decisions (not yet resolved)
+
+These are genuine product/architecture choices the critique surfaced. They are **not** bugs — each has a defensible default, but the call should be made deliberately before or during the relevant task.
+
+1. **Rating window (2 min) vs. song length / skips** (Task 6). `pollSpotify()` does `if (windowOpen) return`, so any track change is ignored while a rating window is open. Songs shorter than 2 minutes, or rapid skips, get dropped or misaligned (you rate a song that already ended). Options: (a) keep the loose party-game behavior (current); (b) shorten/dynamically size the window to the track's `duration_ms`; (c) close the window early when the track changes. **Default if undecided: (a).**
+
+2. **Analysis cache strategy** (analysis route). The cache key is the rated-song *count*, which keeps changing during active listening, so the cache rarely hits mid-trip — and each miss fires N personality + 1 group Claude calls (≈11 for 10 people), making the endpoint slow exactly when used. Options: (a) add a short TTL (e.g. regenerate at most every few minutes); (b) only regenerate when count crosses a threshold (every +5 songs); (c) accept current behavior since cost is low. **Default if undecided: (b).**
+
+3. **DJ identification & OAuth auth** (Tasks 7/11). `isCreator` is a name string-match (`participantName === creatorName`), which breaks on duplicate names; and `/api/spotify/login` has no auth and the OAuth `state` is the plaintext `tripId` (no CSRF nonce) — anyone with a `tripId` can bind their own Spotify as the DJ. Options: (a) accept for a trusted-friends hobby app (current); (b) issue a creator secret/token at trip creation and require it for `login` + identify the creator by participant id, with a random `state`. **Default if undecided: (a), with a note to revisit if shared publicly.**
+
+4. **`totalCount` from live sockets** (already noted as a known limitation) — a backgrounded/refreshing tab transiently drops the denominator. Acceptable for v1.
 
 ---
 

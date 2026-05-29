@@ -4,7 +4,7 @@
 
 Real-time road trip music rating app. The trip creator (the DJ) connects their own Spotify via in-app OAuth; their playback auto-broadcasts songs to the group via WebSocket. Everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
 
-**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. GitHub issues mirror each task (titles synced to the revised plan): https://github.com/boazadato/listening-road-trip/issues — **note:** issue numbers do NOT equal task numbers (created out of order); each task header prints the exact `gh issue close <#>` to run.
+**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. The plan is the single source of truth for the task list (no separate issue tracker); identify the next task as the lowest-numbered one whose final commit isn't yet in `git log`.
 
 ## Tech Stack
 
@@ -140,9 +140,11 @@ One concern per commit. Commit after each passing test cycle, not at end of day.
 Refresh tokens are **per-trip** and obtained via the in-app Spotify OAuth flow — there is no one-time token script and no global `SPOTIFY_REFRESH_TOKEN` secret. See Task 17 in the plan for full detail.
 
 ```bash
-# One-time: register the Spotify app, adding both redirect URIs:
-#   http://localhost:8787/api/spotify/callback
-#   https://listening-road-trip.<account>.workers.dev/api/spotify/callback
+# One-time: register the Spotify app. Redirect URIs MUST be HTTPS (Spotify removed
+# http/localhost support in the Nov 2025 OAuth migration). Add:
+#   https://listening-road-trip.<account>.workers.dev/api/spotify/callback   (prod)
+#   https://<tunnel>.trycloudflare.com/api/spotify/callback                  (only if testing OAuth locally via `cloudflared tunnel`)
+# Dev mode is capped at 5 allowlisted users and needs Premium; add each DJ's email under User Management.
 
 # Create prod D1 and copy database_id into wrangler.toml
 cd worker && npx wrangler d1 create listening-road-trip
