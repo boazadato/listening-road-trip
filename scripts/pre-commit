@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fast pre-commit: pure unit tests + type-check only
+# Skips gracefully if project isn't scaffolded yet
+# Full API integration tests run via `make test` (slower, Miniflare startup)
+set -e
+
+if [ ! -d "worker/src" ]; then
+  echo "⏭  worker not scaffolded yet — skipping pre-commit tests"
+  exit 0
+fi
+
+make test-fast

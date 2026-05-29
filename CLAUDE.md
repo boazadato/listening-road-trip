@@ -19,19 +19,26 @@ Real-time road trip music rating app. DJ's Spotify auto-broadcasts songs to the 
 ## Local Dev Setup
 
 ```bash
+# First-time only: install pre-commit hook
+make setup
+
 pnpm install
 
 # Apply D1 schema locally
 cd worker && npx wrangler d1 execute listening-road-trip --local --file=schema.sql
-
-# Build frontend first (Worker serves it as static assets)
-cd frontend && pnpm build
-
-# Run Worker with local Miniflare emulation (DOs + D1 + alarms all work)
-cd worker && npx wrangler dev --local
 ```
 
-Visit `http://localhost:8787`. The Vite proxy in `vite.config.ts` forwards `/api` and `/ws` to port 8787, so `pnpm dev` in `frontend/` works for hot-reload during UI development.
+## Makefile Commands
+
+| Command | What it does |
+|---|---|
+| `make dev` | Build frontend + start Worker with Miniflare (DOs + D1 + alarms emulated) |
+| `make test` | Full suite: unit tests + API integration tests + type-check (both packages) |
+| `make test-fast` | Pure unit tests + type-check only (what pre-commit runs) |
+| `make deploy` | Build frontend + apply D1 schema + deploy Worker to Cloudflare |
+| `make setup` | Install pre-commit hook from `scripts/pre-commit` |
+
+Visit `http://localhost:8787` after `make dev`. For hot-reload during UI work, `pnpm dev` in `frontend/` forwards `/api` and `/ws` to port 8787 via the Vite proxy.
 
 **No Cloudflare account needed for local dev.** Miniflare emulates everything including Durable Objects, alarms, and D1.
 
@@ -83,7 +90,7 @@ it('shows urgent color under 15 seconds', () => {
 
 ### E2E — Playwright MCP (QA gate)
 
-Run against `wrangler dev --local`. Tests the golden path and key edge cases.
+Run against a manually started `wrangler dev --local` (port 8787). Tests the golden path and key edge cases.
 
 ```
 e2e/
@@ -91,7 +98,9 @@ e2e/
   analysis.spec.ts    # 10 songs rated → analysis tab unlocks
 ```
 
-Use the Playwright MCP tool (`mcp__playwright__*`) to drive the browser. Take screenshots at key steps.
+**Agent workflow:** Use Playwright MCP tools (`mcp__playwright__*`) directly to drive the browser. After each meaningful feature change, navigate to the running app and verify the affected flow. Take screenshots at key steps. Adjust tests if behavior changed intentionally.
+
+The agent runs E2E manually — not auto-triggered by CI or pre-commit. Start `make dev` first, then drive the browser via Playwright MCP.
 
 ## Running Tests
 
