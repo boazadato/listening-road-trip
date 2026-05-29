@@ -2,9 +2,9 @@
 
 ## What We're Building
 
-Real-time road trip music rating app. DJ's Spotify auto-broadcasts songs to the group via WebSocket. Everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
+Real-time road trip music rating app. The trip creator (the DJ) connects their own Spotify via in-app OAuth; their playback auto-broadcasts songs to the group via WebSocket. Everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
 
-**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. GitHub issues mirror each task: https://github.com/boazadato/listening-road-trip/issues
+**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. GitHub issues mirror each task: https://github.com/boazadato/listening-road-trip/issues — **note:** the plan was revised (Task 16 is now Playwright E2E; the old Spotify-token-script task is gone), so re-sync issue titles before running sessions.
 
 ## Tech Stack
 
@@ -13,7 +13,7 @@ Real-time road trip music rating app. DJ's Spotify auto-broadcasts songs to the 
 | Frontend | React + Vite (served as static assets from Worker) |
 | Backend | Cloudflare Workers + Durable Objects + D1 (SQLite) |
 | Real-time | Durable Object per trip (WebSocket hub + Spotify polling alarm) |
-| Song detection | Spotify Web API (currently-playing, audio features) |
+| Song detection | Spotify Web API (currently-playing only; per-trip OAuth — audio-features is deprecated and unused) |
 | Taste analysis | Claude API (claude-haiku-4-5) |
 | Deploy | Cloudflare via `wrangler deploy` |
 | Package manager | pnpm workspaces (`worker/` + `frontend/`) |
@@ -137,14 +137,19 @@ One concern per commit. Commit after each passing test cycle, not at end of day.
 
 ## Deploy
 
-```bash
-# One-time: get Spotify refresh token
-SPOTIFY_CLIENT_ID=xxx SPOTIFY_CLIENT_SECRET=yyy node scripts/get-spotify-token.mjs
+Refresh tokens are **per-trip** and obtained via the in-app Spotify OAuth flow — there is no one-time token script and no global `SPOTIFY_REFRESH_TOKEN` secret. See Task 17 in the plan for full detail.
 
-# Set secrets
+```bash
+# One-time: register the Spotify app, adding both redirect URIs:
+#   http://localhost:8787/api/spotify/callback
+#   https://listening-road-trip.<account>.workers.dev/api/spotify/callback
+
+# Create prod D1 and copy database_id into wrangler.toml
+cd worker && npx wrangler d1 create listening-road-trip
+
+# Set secrets (app-level only — no refresh token here)
 npx wrangler secret put SPOTIFY_CLIENT_ID
 npx wrangler secret put SPOTIFY_CLIENT_SECRET
-npx wrangler secret put SPOTIFY_REFRESH_TOKEN
 npx wrangler secret put CLAUDE_API_KEY
 
 # Apply schema to production D1
@@ -159,9 +164,11 @@ cd worker && npx wrangler deploy
 
 - **One Durable Object per trip** (keyed by `tripId`). Holds all WebSocket connections and runs the Spotify polling alarm every 5 seconds.
 - **Alarm loop**: `alarm()` fires every 5 seconds via `ctx.storage.setAlarm()`. Checks if rating window expired (reveal) then polls Spotify. If new song, broadcasts `song_started`.
-- **Song persistence bridge**: The DO detects a new song via Spotify but doesn't have D1 access. It calls back to the Worker via internal fetch (`/api/trips/:code/songs`) to persist the song, which returns the DB `id`. The DO then stores `songDbId:trackId → id` mapping so it can reference the correct DB record in `song_started` broadcasts.
-- **Rating persistence**: Ratings are stored in DO memory during the window (for fast X/N counting), and also written to D1 via `POST /api/trips/:code/rate` for permanent storage. DO memory resets on cold start, D1 is the source of truth.
-- **Auth**: No user auth. Participants are identified by a generated `participantId` stored in `sessionStorage`. If they close and reopen the tab, they re-join with the same ID (name collision = same participant, via `ON CONFLICT DO NOTHING` + lookup).
+- **DO owns persistence (no bridge)**: The Durable Object receives the same `env` as the Worker, including the D1 binding. It writes songs (`createSong`) and ratings (`upsertRating`) **directly via `this.env.DB`** — there is no Worker round-trip, no `/songs`/`/register-song` route, no `songDbId` mapping. The `song_started` broadcast carries the real DB id created in `pollSpotify()`.
+- **Rating persistence**: Ratings are kept in DO storage during the window (fast X/N counting) and upserted to D1 in the same `handleRating()` call. DO storage survives cold starts; D1 is the source of truth for leaderboard/analysis.
+- **Per-trip Spotify OAuth**: One Spotify app (global `SPOTIFY_CLIENT_ID`/`SECRET`). The **creator** authorizes via `/api/spotify/login` → `/api/spotify/callback`, which stores a per-trip `refresh_token` on the trip row. The DO reads that token from D1 (cached in memory) to poll. No global refresh token. `/start-polling` is pinged after callback so the DO picks up the new token.
+- **Analysis caching**: `GET /api/trips/:code/analysis` caches its Claude result in the `analysis_cache` table and regenerates only when the rated-song count changes — avoids re-billing Claude on every tab open.
+- **Auth**: No user auth. Participants are identified by a generated `participantId` stored in `sessionStorage` (which also survives the Spotify OAuth redirect). Name collision = same participant, via `ON CONFLICT DO NOTHING` + lookup.
 
 ## File Ownership Quick Reference
 

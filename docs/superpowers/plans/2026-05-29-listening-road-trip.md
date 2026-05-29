@@ -1,10 +1,26 @@
 # Listening Road Trip Implementation Plan
 
-**Goal:** Build a real-time road trip music rating web app where a DJ's Spotify playback auto-broadcasts to the group, everyone rates with emojis, and a leaderboard + AI taste analysis accumulate over the trip.
+**Goal:** Build a real-time road trip music rating web app where the trip creator's Spotify playback auto-broadcasts to the group, everyone rates with emojis, and a leaderboard + AI taste analysis accumulate over the trip.
 
-**Architecture:** A single Cloudflare Worker serves the built React frontend as static assets plus all API routes. Each trip has a Durable Object that (a) holds WebSocket connections for all participants and (b) polls Spotify every 5 seconds via an alarm, broadcasting new songs and closing rating windows automatically. D1 (SQLite) persists trips, participants, songs, and ratings.
+**Architecture:** A single Cloudflare Worker serves the built React frontend as static assets plus all API routes. Each trip has a Durable Object that (a) holds WebSocket connections for all participants and (b) polls Spotify every 5 seconds via an alarm, broadcasting new songs and closing rating windows automatically. **The Durable Object has direct access to D1** (same `env` as the Worker) and persists songs and ratings itself — there is no Worker round-trip bridge. D1 (SQLite) persists trips, participants, songs, ratings, and a cached analysis payload.
 
-**Tech Stack:** React + Vite (frontend), Cloudflare Workers + Durable Objects + D1 (backend), Spotify Web API (song detection + audio features), Claude API (personality generation), pnpm workspaces, TypeScript, Vitest
+**Spotify model:** Per-trip OAuth. One Spotify app is registered (global `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`). The trip **creator** connects their own Spotify via an in-app OAuth flow; the resulting refresh token is stored on the trip row. The trip's Durable Object reads that token from D1 to poll. Non-creators just rate.
+
+**Tech Stack:** React + Vite (frontend), Cloudflare Workers + Durable Objects + D1 (backend), Spotify Web API (currently-playing only — audio-features is deprecated and not used), Claude API (personality + group-taste generation, inferred from titles/artists/scores), pnpm workspaces, TypeScript, Vitest.
+
+---
+
+## Revision Note (2026-05-29)
+
+This plan was rewritten after a critical review of the first draft. Key corrections:
+
+1. **DO owns persistence.** The original DO↔Worker "song bridge" (`/api/.../songs`, `/register-song`, `songDbId:` mapping) was never wired up — songs and ratings were silently dropped in production. Durable Objects receive the same `env` as the Worker (including the D1 binding), so the DO now writes D1 directly. The bridge is removed.
+2. **Per-trip Spotify OAuth** replaces the single global refresh token. The schema's `spotify_refresh_token` column is now live; the one-time `get-spotify-token.mjs` script is removed in favor of an in-app OAuth flow (creator only).
+3. **Audio features dropped.** Spotify deprecated `audio-features`/`audio-analysis` for apps created after 2024-11-27. Claude now infers genre/vibe from titles + artists + scores.
+4. **Fixes:** single-JOIN leaderboard query (no N+1), cached analysis (no Claude re-billing on every tab open), `.gitignore`, deferred `wrangler d1 create` to deploy, wrangler v4 + current compat date, hardened `parseCurrentlyPlaying` (skips ads/podcasts), removed build-breaking unused `ctx`, dropped unnecessary CORS (same-origin).
+5. **Tests:** added an API integration test task (`SELF` binding) + key frontend behavior tests, per CLAUDE.md's "API tests are primary" strategy.
+
+> **GitHub issues need re-syncing.** The task set changed (Task 16 is now Playwright E2E; the old token-script task is gone; Spotify OAuth setup folded into Task 17). Re-title/close issues to match before running sessions.
 
 ---
 
@@ -42,13 +58,8 @@ Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 - `wrangler dev --local` fully emulates Durable Objects, alarms, and D1 via Miniflare — no Cloudflare account needed
 - Tests run inside Miniflare via `@cloudflare/vitest-pool-workers` using the `SELF` binding for real HTTP calls
 - Frontend builds to `frontend-dist/` and is served as static assets by the Worker
-- Secrets (Spotify, Claude API key) are set via `wrangler secret put` — handled in Task 16
+- Local secrets live in `worker/.dev.vars` (gitignored); production secrets are set via `wrangler secret put` (Task 17)
 - TDD loop: `cd worker && pnpm test --watch` re-runs on every file save
-
-### GitHub Issues
-
-Each task maps 1:1 to a GitHub issue at https://github.com/boazadato/listening-road-trip/issues
-Close your issue at session end with `gh issue close #N`.
 
 ---
 
@@ -56,51 +67,59 @@ Close your issue at session end with `gh issue close #N`.
 
 ```
 /
-├── wrangler.toml                        # Cloudflare config (assets, DO, D1, secrets)
+├── .gitignore
+├── wrangler.toml                        # Cloudflare config (assets, DO, D1)
 ├── package.json                         # pnpm workspace root
 ├── worker/
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── schema.sql                       # D1 schema (source of truth)
 │   ├── vitest.config.ts
+│   ├── .dev.vars                        # local secrets (gitignored)
 │   └── src/
-│       ├── index.ts                     # Worker entry: routing, CORS, WebSocket upgrade
-│       ├── TripRoom.ts                  # Durable Object: WebSocket hub + Spotify polling
+│       ├── index.ts                     # Worker entry: routing, Spotify OAuth, WS upgrade
+│       ├── TripRoom.ts                  # Durable Object: WS hub + Spotify polling + D1 writes
 │       ├── db.ts                        # D1 typed query helpers
-│       ├── spotify.ts                   # Token refresh + currently-playing + audio features
-│       ├── claude.ts                    # Personality generation via Claude API
+│       ├── spotify.ts                   # Token refresh + OAuth exchange + currently-playing
+│       ├── claude.ts                    # Personality + group taste generation
 │       ├── types.ts                     # Shared types (WS messages, DB rows, API payloads)
-│       └── utils.ts                     # Short code generation, nanoid wrapper
+│       └── utils.ts                     # Short code / id generation, response helpers
 │   └── test/
+│       ├── api.test.ts                  # Integration tests (SELF binding) — primary
 │       ├── spotify.test.ts
-│       ├── utils.test.ts
-│       └── db.test.ts
+│       └── utils.test.ts
 ├── frontend/
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── vite.config.ts
+│   ├── vitest.config.ts
 │   ├── index.html
 │   └── src/
 │       ├── main.tsx
 │       ├── App.tsx                      # React Router: / and /trip/:code
-│       ├── types.ts                     # Mirrors worker/src/types.ts (WS messages, etc.)
+│       ├── index.css
+│       ├── types.ts                     # Mirrors worker/src/types.ts
 │       ├── pages/
-│       │   ├── Home.tsx                 # Create trip form + join trip form
-│       │   └── Trip.tsx                 # Tab layout: Current Song | Leaderboard | Analysis
+│       │   ├── Home.tsx
+│       │   └── Trip.tsx
 │       ├── components/
 │       │   ├── CreateTripForm.tsx
 │       │   ├── JoinTripForm.tsx
-│       │   ├── CurrentSong.tsx          # Song card + emoji buttons + timer + counter
-│       │   ├── RatingButtons.tsx        # 5 emoji buttons, handles selection
-│       │   ├── CountdownTimer.tsx       # Circular countdown, fires onExpire
-│       │   ├── RatingReveal.tsx         # Animated reveal of all ratings
-│       │   ├── Leaderboard.tsx          # Sorted song list with avg scores
-│       │   ├── Analysis.tsx             # Personality cards + group summary (unlocks at 10)
-│       │   ├── QRCode.tsx               # QR code + copy link
-│       │   └── ReconnectToast.tsx       # "Reconnecting..." banner
+│       │   ├── CurrentSong.tsx
+│       │   ├── RatingButtons.tsx
+│       │   ├── CountdownTimer.tsx
+│       │   ├── RatingReveal.tsx
+│       │   ├── Leaderboard.tsx
+│       │   ├── Analysis.tsx
+│       │   ├── QRCode.tsx
+│       │   ├── ConnectSpotify.tsx       # "DJ, connect Spotify" prompt
+│       │   └── ReconnectToast.tsx
+│       │   └── __tests__/
+│       │       ├── CountdownTimer.test.tsx
+│       │       └── tripStore.test.ts
 │       └── hooks/
-│           ├── useWebSocket.ts          # WS connection, reconnect, message dispatch
-│           └── useTripStore.ts          # Zustand store: trip state, songs, ratings
+│           ├── useWebSocket.ts
+│           └── useTripStore.ts
 ```
 
 ---
@@ -112,17 +131,33 @@ Close your issue at session end with `gh issue close #N`.
 **Prerequisites:** None — this is the first task. The repo root contains only `CLAUDE.md`, `Makefile`, `scripts/`, and `docs/`.
 
 **Files:**
+- Create: `.gitignore`
 - Create: `package.json`
 - Create: `wrangler.toml`
 - Create: `worker/package.json`
 - Create: `worker/tsconfig.json`
 - Create: `worker/vitest.config.ts`
+- Create: `worker/.dev.vars`
 - Create: `frontend/package.json`
 - Create: `frontend/tsconfig.json`
 - Create: `frontend/vite.config.ts`
+- Create: `frontend/vitest.config.ts`
 - Create: `frontend/index.html`
 
-- [ ] **Step 1: Create pnpm workspace root**
+- [ ] **Step 1: Create `.gitignore`**
+
+```gitignore
+# .gitignore
+node_modules/
+frontend-dist/
+.wrangler/
+dist/
+.dev.vars
+*.log
+.DS_Store
+```
+
+- [ ] **Step 2: Create pnpm workspace root**
 
 ```json
 // package.json
@@ -134,7 +169,9 @@ Close your issue at session end with `gh issue close #N`.
 }
 ```
 
-- [ ] **Step 2: Create worker package**
+- [ ] **Step 3: Create worker package**
+
+We use the Claude and Spotify APIs via raw `fetch` — no SDK dependency.
 
 ```json
 // worker/package.json
@@ -144,17 +181,15 @@ Close your issue at session end with `gh issue close #N`.
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "vitest run"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.27.0"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.5.0",
-    "@cloudflare/workers-types": "^4.20240512.0",
-    "typescript": "^5.4.5",
-    "vitest": "^1.6.0",
-    "wrangler": "^3.57.0"
+    "@cloudflare/vitest-pool-workers": "^0.6.0",
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.0.0"
   }
 }
 ```
@@ -170,7 +205,8 @@ Close your issue at session end with `gh issue close #N`.
     "types": ["@cloudflare/workers-types"],
     "strict": true,
     "noUnusedLocals": true,
-    "noUnusedParameters": true
+    "noUnusedParameters": true,
+    "skipLibCheck": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }
@@ -191,7 +227,16 @@ export default defineWorkersConfig({
 })
 ```
 
-- [ ] **Step 3: Create frontend package**
+```
+# worker/.dev.vars  (gitignored — local secrets for `wrangler dev`)
+SPOTIFY_CLIENT_ID=your_local_client_id
+SPOTIFY_CLIENT_SECRET=your_local_client_secret
+CLAUDE_API_KEY=your_local_claude_key
+```
+
+> For pure local UI work you can leave these as placeholders — Spotify polling just no-ops until a real token exists. Real values are only needed to test the live OAuth + polling path.
+
+- [ ] **Step 4: Create frontend package**
 
 ```json
 // frontend/package.json
@@ -201,24 +246,27 @@ export default defineWorkersConfig({
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.23.1",
-    "zustand": "^4.5.2",
-    "qrcode.react": "^3.1.0"
+    "react-router-dom": "^6.26.0",
+    "zustand": "^4.5.5",
+    "qrcode.react": "^4.1.0"
   },
   "devDependencies": {
-    "@testing-library/react": "^15.0.7",
+    "@testing-library/jest-dom": "^6.5.0",
+    "@testing-library/react": "^16.0.1",
     "@testing-library/user-event": "^14.5.2",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.0",
-    "typescript": "^5.4.5",
-    "vitest": "^1.6.0",
-    "vite": "^5.2.12"
+    "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.0"
   }
 }
 ```
@@ -240,7 +288,8 @@ export default defineWorkersConfig({
     "jsx": "react-jsx",
     "strict": true,
     "noUnusedLocals": true,
-    "noUnusedParameters": true
+    "noUnusedParameters": true,
+    "types": ["vitest/globals", "@testing-library/jest-dom"]
   },
   "include": ["src"]
 }
@@ -259,8 +308,28 @@ export default defineConfig({
       '/ws': { target: 'ws://localhost:8787', ws: true },
     },
   },
-  build: { outDir: '../frontend-dist' },
+  build: { outDir: '../frontend-dist', emptyOutDir: true },
 })
+```
+
+```typescript
+// frontend/vitest.config.ts
+import { defineConfig } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./src/test-setup.ts'],
+  },
+})
+```
+
+```typescript
+// frontend/src/test-setup.ts
+import '@testing-library/jest-dom/vitest'
 ```
 
 ```html
@@ -279,13 +348,15 @@ export default defineConfig({
 </html>
 ```
 
-- [ ] **Step 4: Create wrangler.toml**
+- [ ] **Step 5: Create wrangler.toml**
+
+The `database_id` is a placeholder for local dev (Miniflare ignores it). The real id is created and filled in at deploy (Task 17). The Spotify redirect URI is derived from the request origin at runtime — no config needed here.
 
 ```toml
 # wrangler.toml
 name = "listening-road-trip"
 main = "worker/src/index.ts"
-compatibility_date = "2024-05-01"
+compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 [assets]
@@ -303,19 +374,18 @@ new_classes = ["TripRoom"]
 [[d1_databases]]
 binding = "DB"
 database_name = "listening-road-trip"
-database_id = "REPLACE_WITH_ACTUAL_ID"
+database_id = "placeholder-local-dev"   # replace with real id at deploy (Task 17)
 
 [vars]
 ENVIRONMENT = "development"
 
-# Secrets (set via `wrangler secret put`):
+# Secrets (set via `wrangler secret put` at deploy — Task 17):
 # SPOTIFY_CLIENT_ID
 # SPOTIFY_CLIENT_SECRET
-# SPOTIFY_REFRESH_TOKEN
 # CLAUDE_API_KEY
 ```
 
-- [ ] **Step 5: Install dependencies**
+- [ ] **Step 6: Install dependencies**
 
 ```bash
 pnpm install
@@ -323,18 +393,10 @@ pnpm install
 
 Expected: packages installed in `worker/node_modules` and `frontend/node_modules`.
 
-- [ ] **Step 6: Create D1 database**
-
-```bash
-cd worker && npx wrangler d1 create listening-road-trip
-```
-
-Copy the `database_id` from output into `wrangler.toml`.
-
 - [ ] **Step 7: Commit**
 
 ```bash
-git add package.json wrangler.toml worker/ frontend/
+git add .gitignore package.json wrangler.toml worker/ frontend/
 git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config" && git push && gh issue close 1
 ```
 
@@ -344,7 +406,7 @@ git commit -m "feat: scaffold project — pnpm workspaces, Worker, React/Vite, w
 
 **GitHub issue:** #2 — close with `gh issue close 2` at session end
 
-**Prerequisites:** Task 1 complete. Verify before starting:
+**Prerequisites:** Task 1 complete. Verify:
 ```bash
 ls package.json wrangler.toml worker/package.json frontend/package.json
 ```
@@ -381,7 +443,6 @@ export interface Song {
   title: string
   artist: string
   album_art: string | null
-  audio_features: string | null  // JSON-encoded SpotifyAudioFeatures
   identified_at: number
 }
 
@@ -392,14 +453,6 @@ export interface Rating {
   emoji: string
   score: number
   submitted_at: number
-}
-
-export interface SpotifyAudioFeatures {
-  tempo: number
-  energy: number
-  danceability: number
-  valence: number
-  genres: string[]
 }
 
 export interface SpotifyTrack {
@@ -417,7 +470,7 @@ export type ServerMessage =
   | { type: 'song_started'; song: SongInfo; windowEndsAt: number; participantCount: number }
   | { type: 'rating_update'; ratedCount: number; totalCount: number }
   | { type: 'rating_reveal'; songId: string; ratings: RatingInfo[]; averageScore: number }
-  | { type: 'error'; message: string }
+  | { type: 'pong' }
 
 // WebSocket message types — client → server
 export type ClientMessage =
@@ -443,6 +496,7 @@ export interface TripState {
   tripId: string
   tripName: string
   shortCode: string
+  djConnected: boolean
   participants: Pick<Participant, 'id' | 'name'>[]
   currentSong: SongInfo | null
   windowEndsAt: number | null
@@ -456,10 +510,11 @@ export interface Env {
   ASSETS: Fetcher
   SPOTIFY_CLIENT_ID: string
   SPOTIFY_CLIENT_SECRET: string
-  SPOTIFY_REFRESH_TOKEN: string
   CLAUDE_API_KEY: string
 }
 ```
+
+> Note: `pong` is now its own message type (the first draft hacked it onto `error`). There is no `error` server message — API errors are returned over HTTP, not WS.
 
 - [ ] **Step 2: Write D1 schema**
 
@@ -490,7 +545,6 @@ CREATE TABLE IF NOT EXISTS songs (
   title TEXT NOT NULL,
   artist TEXT NOT NULL,
   album_art TEXT,
-  audio_features TEXT,
   identified_at INTEGER NOT NULL
 );
 
@@ -502,6 +556,15 @@ CREATE TABLE IF NOT EXISTS ratings (
   score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 5),
   submitted_at INTEGER NOT NULL,
   UNIQUE(song_id, participant_id)
+);
+
+-- Cached Claude analysis so we don't re-bill on every tab open.
+-- Regenerated when rated_songs_count changes.
+CREATE TABLE IF NOT EXISTS analysis_cache (
+  trip_id TEXT PRIMARY KEY REFERENCES trips(id),
+  payload TEXT NOT NULL,
+  rated_songs_count INTEGER NOT NULL,
+  generated_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_participants_trip ON participants(trip_id);
@@ -516,13 +579,13 @@ CREATE INDEX IF NOT EXISTS idx_ratings_participant ON ratings(participant_id);
 cd worker && npx wrangler d1 execute listening-road-trip --local --file=schema.sql
 ```
 
-Expected: "Successfully executed 1 commands"
+Expected: "Successfully executed N commands"
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add worker/src/types.ts worker/schema.sql
-git commit -m "feat: types and D1 schema" && git push && gh issue close 2
+git commit -m "feat: types and D1 schema (per-trip token, analysis cache, no audio features)" && git push && gh issue close 2
 ```
 
 ---
@@ -540,7 +603,6 @@ ls worker/src/types.ts worker/schema.sql
 - Create: `worker/src/utils.ts`
 - Create: `worker/src/db.ts`
 - Create: `worker/test/utils.test.ts`
-- Create: `worker/test/db.test.ts`
 
 - [ ] **Step 1: Write utils test**
 
@@ -550,23 +612,18 @@ import { describe, it, expect } from 'vitest'
 import { generateShortCode, generateId } from '../src/utils'
 
 describe('generateShortCode', () => {
-  it('returns 6 uppercase alphanumeric characters', () => {
+  it('returns 6 uppercase alphanumeric characters (no ambiguous chars)', () => {
     const code = generateShortCode()
-    expect(code).toMatch(/^[A-Z0-9]{6}$/)
+    expect(code).toMatch(/^[A-HJ-NP-Z2-9]{6}$/)
   })
 
-  it('generates unique codes', () => {
+  it('generates mostly-unique codes', () => {
     const codes = new Set(Array.from({ length: 100 }, generateShortCode))
     expect(codes.size).toBeGreaterThan(95)
   })
 })
 
 describe('generateId', () => {
-  it('returns a non-empty string', () => {
-    expect(generateId()).toBeTruthy()
-    expect(typeof generateId()).toBe('string')
-  })
-
   it('generates unique ids', () => {
     const ids = new Set(Array.from({ length: 100 }, generateId))
     expect(ids.size).toBe(100)
@@ -627,6 +684,8 @@ Expected: PASS
 
 - [ ] **Step 5: Implement D1 helpers**
 
+The leaderboard uses a **single LEFT JOIN query** (not N+1). Ratings are grouped in memory.
+
 ```typescript
 // worker/src/db.ts
 import type { Trip, Participant, Song, Rating } from './types'
@@ -649,6 +708,10 @@ export async function getTripByCode(db: D1Database, code: string): Promise<Trip 
 
 export async function getTripById(db: D1Database, id: string): Promise<Trip | null> {
   return db.prepare('SELECT * FROM trips WHERE id = ?').bind(id).first<Trip>()
+}
+
+export async function setTripSpotifyToken(db: D1Database, tripId: string, refreshToken: string): Promise<void> {
+  await db.prepare('UPDATE trips SET spotify_refresh_token = ? WHERE id = ?').bind(refreshToken, tripId).run()
 }
 
 export async function createParticipant(
@@ -678,18 +741,10 @@ export async function getParticipants(db: D1Database, tripId: string): Promise<P
 export async function createSong(db: D1Database, song: Omit<Song, 'identified_at'>): Promise<Song> {
   const row = { ...song, identified_at: Date.now() }
   await db
-    .prepare('INSERT INTO songs (id, trip_id, spotify_track_id, title, artist, album_art, audio_features, identified_at) VALUES (?,?,?,?,?,?,?,?)')
-    .bind(row.id, row.trip_id, row.spotify_track_id, row.title, row.artist, row.album_art ?? null, row.audio_features ?? null, row.identified_at)
+    .prepare('INSERT INTO songs (id, trip_id, spotify_track_id, title, artist, album_art, identified_at) VALUES (?,?,?,?,?,?,?)')
+    .bind(row.id, row.trip_id, row.spotify_track_id, row.title, row.artist, row.album_art ?? null, row.identified_at)
     .run()
   return row as Song
-}
-
-export async function getSongs(db: D1Database, tripId: string): Promise<Song[]> {
-  const result = await db
-    .prepare('SELECT * FROM songs WHERE trip_id = ? ORDER BY identified_at ASC')
-    .bind(tripId)
-    .all<Song>()
-  return result.results
 }
 
 export async function upsertRating(db: D1Database, rating: Omit<Rating, 'submitted_at'>): Promise<void> {
@@ -703,43 +758,104 @@ export async function upsertRating(db: D1Database, rating: Omit<Rating, 'submitt
     .run()
 }
 
-export async function getRatingsForSong(db: D1Database, songId: string): Promise<(Rating & { participant_name: string })[]> {
+export interface LeaderboardSong {
+  song: Song
+  ratings: (Pick<Rating, 'participant_id' | 'emoji' | 'score'> & { participant_name: string })[]
+  averageScore: number
+}
+
+interface LeaderboardRow {
+  id: string
+  trip_id: string
+  spotify_track_id: string
+  title: string
+  artist: string
+  album_art: string | null
+  identified_at: number
+  participant_id: string | null
+  emoji: string | null
+  score: number | null
+  participant_name: string | null
+}
+
+// Single LEFT JOIN — one query for the whole leaderboard (no N+1).
+export async function getLeaderboard(db: D1Database, tripId: string): Promise<LeaderboardSong[]> {
   const result = await db
     .prepare(`
-      SELECT r.*, p.name as participant_name
-      FROM ratings r
-      JOIN participants p ON r.participant_id = p.id
-      WHERE r.song_id = ?
+      SELECT s.id, s.trip_id, s.spotify_track_id, s.title, s.artist, s.album_art, s.identified_at,
+             r.participant_id, r.emoji, r.score, p.name AS participant_name
+      FROM songs s
+      LEFT JOIN ratings r ON r.song_id = s.id
+      LEFT JOIN participants p ON p.id = r.participant_id
+      WHERE s.trip_id = ?
+      ORDER BY s.identified_at ASC
     `)
-    .bind(songId)
-    .all<Rating & { participant_name: string }>()
-  return result.results
+    .bind(tripId)
+    .all<LeaderboardRow>()
+
+  const bySong = new Map<string, LeaderboardSong>()
+  for (const row of result.results) {
+    let entry = bySong.get(row.id)
+    if (!entry) {
+      entry = {
+        song: {
+          id: row.id,
+          trip_id: row.trip_id,
+          spotify_track_id: row.spotify_track_id,
+          title: row.title,
+          artist: row.artist,
+          album_art: row.album_art,
+          identified_at: row.identified_at,
+        },
+        ratings: [],
+        averageScore: 0,
+      }
+      bySong.set(row.id, entry)
+    }
+    if (row.participant_id && row.emoji && row.score != null) {
+      entry.ratings.push({
+        participant_id: row.participant_id,
+        emoji: row.emoji,
+        score: row.score,
+        participant_name: row.participant_name ?? '',
+      })
+    }
+  }
+
+  for (const entry of bySong.values()) {
+    entry.averageScore =
+      entry.ratings.length > 0
+        ? entry.ratings.reduce((sum, r) => sum + r.score, 0) / entry.ratings.length
+        : 0
+  }
+
+  return Array.from(bySong.values())
 }
 
-export async function updateSongAudioFeatures(db: D1Database, songId: string, features: string): Promise<void> {
+export async function getAnalysisCache(
+  db: D1Database,
+  tripId: string
+): Promise<{ payload: string; rated_songs_count: number } | null> {
+  return db
+    .prepare('SELECT payload, rated_songs_count FROM analysis_cache WHERE trip_id = ?')
+    .bind(tripId)
+    .first<{ payload: string; rated_songs_count: number }>()
+}
+
+export async function setAnalysisCache(
+  db: D1Database,
+  tripId: string,
+  payload: string,
+  ratedSongsCount: number
+): Promise<void> {
   await db
-    .prepare('UPDATE songs SET audio_features = ? WHERE id = ?')
-    .bind(features, songId)
+    .prepare(`
+      INSERT INTO analysis_cache (trip_id, payload, rated_songs_count, generated_at)
+      VALUES (?,?,?,?)
+      ON CONFLICT(trip_id) DO UPDATE SET payload=excluded.payload, rated_songs_count=excluded.rated_songs_count, generated_at=excluded.generated_at
+    `)
+    .bind(tripId, payload, ratedSongsCount, Date.now())
     .run()
-}
-
-export async function getSongsWithRatings(db: D1Database, tripId: string): Promise<{
-  song: Song
-  ratings: (Rating & { participant_name: string })[]
-  averageScore: number
-}[]> {
-  const songs = await getSongs(db, tripId)
-  const results = await Promise.all(
-    songs.map(async (song) => {
-      const ratings = await getRatingsForSong(db, song.id)
-      const averageScore =
-        ratings.length > 0
-          ? ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length
-          : 0
-      return { song, ratings, averageScore }
-    })
-  )
-  return results
 }
 ```
 
@@ -747,7 +863,7 @@ export async function getSongsWithRatings(db: D1Database, tripId: string): Promi
 
 ```bash
 git add worker/src/utils.ts worker/src/db.ts worker/test/
-git commit -m "feat: utils (id/code generation) and D1 typed query helpers" && git push && gh issue close 3
+git commit -m "feat: utils and D1 helpers — per-trip token, single-JOIN leaderboard, analysis cache" && git push && gh issue close 3
 ```
 
 ---
@@ -765,12 +881,14 @@ ls worker/src/utils.ts worker/src/db.ts worker/test/utils.test.ts
 - Create: `worker/src/spotify.ts`
 - Create: `worker/test/spotify.test.ts`
 
-- [ ] **Step 1: Write Spotify token refresh test**
+Note: `audio-features` is **not** implemented — Spotify deprecated it for apps created after 2024-11-27. Taste analysis infers genre/vibe from titles/artists/scores (Task 5).
+
+- [ ] **Step 1: Write Spotify tests**
 
 ```typescript
 // worker/test/spotify.test.ts
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { refreshAccessToken, parseCurrentlyPlaying } from '../src/spotify'
+import { describe, it, expect, vi } from 'vitest'
+import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying } from '../src/spotify'
 
 describe('refreshAccessToken', () => {
   it('returns access token from Spotify response', async () => {
@@ -793,16 +911,34 @@ describe('refreshAccessToken', () => {
   })
 })
 
+describe('exchangeCodeForToken', () => {
+  it('returns refresh and access tokens from auth-code exchange', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ access_token: 'a', refresh_token: 'r', expires_in: 3600 }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    )
+    const tokens = await exchangeCodeForToken('id', 'secret', 'the_code', 'http://localhost:8787/api/spotify/callback', mockFetch)
+    expect(tokens.refresh_token).toBe('r')
+  })
+})
+
 describe('parseCurrentlyPlaying', () => {
   it('returns null when nothing is playing', () => {
     expect(parseCurrentlyPlaying(null)).toBeNull()
     expect(parseCurrentlyPlaying({ is_playing: false })).toBeNull()
   })
 
+  it('returns null for non-track items (ads, podcasts)', () => {
+    expect(parseCurrentlyPlaying({ is_playing: true, item: { type: 'episode', id: 'e1' } })).toBeNull()
+    expect(parseCurrentlyPlaying({ is_playing: true, currently_playing_type: 'ad', item: null })).toBeNull()
+  })
+
   it('extracts track info from Spotify response', () => {
     const response = {
       is_playing: true,
       item: {
+        type: 'track',
         id: 'track_123',
         name: 'Bohemian Rhapsody',
         artists: [{ name: 'Queen' }],
@@ -810,8 +946,7 @@ describe('parseCurrentlyPlaying', () => {
         duration_ms: 354000,
       },
     }
-    const track = parseCurrentlyPlaying(response)
-    expect(track).toEqual({
+    expect(parseCurrentlyPlaying(response)).toEqual({
       id: 'track_123',
       title: 'Bohemian Rhapsody',
       artist: 'Queen',
@@ -834,7 +969,7 @@ Expected: FAIL
 
 ```typescript
 // worker/src/spotify.ts
-import type { SpotifyTrack, SpotifyAudioFeatures } from './types'
+import type { SpotifyTrack } from './types'
 
 type FetchFn = typeof fetch
 
@@ -845,21 +980,37 @@ export async function refreshAccessToken(
   fetchFn: FetchFn = fetch
 ): Promise<string> {
   const credentials = btoa(`${clientId}:${clientSecret}`)
-  const body = new URLSearchParams({
-    grant_type: 'refresh_token',
-    refresh_token: refreshToken,
-  })
   const res = await fetchFn('https://accounts.spotify.com/api/token', {
     method: 'POST',
     headers: {
       Authorization: `Basic ${credentials}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body,
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
   })
   if (!res.ok) throw new Error(`Spotify token refresh failed: ${res.status}`)
   const data = await res.json<{ access_token: string; expires_in: number }>()
   return data.access_token
+}
+
+export async function exchangeCodeForToken(
+  clientId: string,
+  clientSecret: string,
+  code: string,
+  redirectUri: string,
+  fetchFn: FetchFn = fetch
+): Promise<{ access_token: string; refresh_token: string; expires_in: number }> {
+  const credentials = btoa(`${clientId}:${clientSecret}`)
+  const res = await fetchFn('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri }),
+  })
+  if (!res.ok) throw new Error(`Spotify code exchange failed: ${res.status}`)
+  return res.json<{ access_token: string; refresh_token: string; expires_in: number }>()
 }
 
 export function parseCurrentlyPlaying(response: unknown): SpotifyTrack | null {
@@ -867,15 +1018,18 @@ export function parseCurrentlyPlaying(response: unknown): SpotifyTrack | null {
   const r = response as Record<string, unknown>
   if (!r.is_playing || !r.item) return null
   const item = r.item as Record<string, unknown>
-  const artists = item.artists as Array<{ name: string }>
-  const album = item.album as Record<string, unknown>
-  const images = album.images as Array<{ url: string }>
+  // Skip ads, podcasts, and anything that isn't a music track
+  if (item.type && item.type !== 'track') return null
+  const artists = (item.artists as Array<{ name: string }> | undefined) ?? []
+  const album = (item.album as Record<string, unknown> | undefined) ?? {}
+  const images = (album.images as Array<{ url: string }> | undefined) ?? []
+  if (!item.id || !item.name) return null
   return {
     id: item.id as string,
     title: item.name as string,
     artist: artists.map(a => a.name).join(', '),
-    album_art: images?.[0]?.url ?? null,
-    duration_ms: item.duration_ms as number,
+    album_art: images[0]?.url ?? null,
+    duration_ms: (item.duration_ms as number) ?? 0,
   }
 }
 
@@ -885,31 +1039,7 @@ export async function fetchCurrentlyPlaying(accessToken: string): Promise<Spotif
   })
   if (res.status === 204 || res.status === 404) return null
   if (!res.ok) throw new Error(`Spotify currently-playing failed: ${res.status}`)
-  const data = await res.json()
-  return parseCurrentlyPlaying(data)
-}
-
-export async function fetchAudioFeatures(
-  trackId: string,
-  accessToken: string
-): Promise<SpotifyAudioFeatures | null> {
-  const res = await fetch(`https://api.spotify.com/v1/audio-features/${trackId}`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  })
-  if (!res.ok) return null
-  const data = await res.json<{
-    tempo: number
-    energy: number
-    danceability: number
-    valence: number
-  }>()
-  return {
-    tempo: data.tempo,
-    energy: data.energy,
-    danceability: data.danceability,
-    valence: data.valence,
-    genres: [],  // Genres are on Artist endpoint, enriched separately if needed
-  }
+  return parseCurrentlyPlaying(await res.json())
 }
 ```
 
@@ -925,12 +1055,12 @@ Expected: PASS
 
 ```bash
 git add worker/src/spotify.ts worker/test/spotify.test.ts
-git commit -m "feat: Spotify client — token refresh, currently-playing, audio features" && git push && gh issue close 4
+git commit -m "feat: Spotify client — token refresh, OAuth code exchange, hardened currently-playing" && git push && gh issue close 4
 ```
 
 ---
 
-## Task 5: Claude Personality Generator
+## Task 5: Claude Taste Generator
 
 **GitHub issue:** #5 — close with `gh issue close 5` at session end
 
@@ -942,6 +1072,8 @@ ls worker/src/spotify.ts worker/test/spotify.test.ts
 **Files:**
 - Create: `worker/src/claude.ts`
 
+Genre/vibe is inferred by Claude from song titles, artists, and scores — there is no audio-features input.
+
 - [ ] **Step 1: Implement Claude client**
 
 ```typescript
@@ -949,7 +1081,7 @@ ls worker/src/spotify.ts worker/test/spotify.test.ts
 
 export interface PersonalityResult {
   label: string    // e.g. "The Reluctant Optimist"
-  roast: string    // 2-line witty roast
+  roast: string    // 2-sentence witty roast
 }
 
 export interface GroupTasteResult {
@@ -962,6 +1094,33 @@ interface RatingPattern {
   participantName: string
   ratingsGiven: { emoji: string; score: number; songTitle: string; artist: string }[]
   averageScore: number
+}
+
+const MODEL = 'claude-haiku-4-5-20251001'
+
+async function callClaude(prompt: string, apiKey: string, maxTokens: number): Promise<string> {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  if (!res.ok) throw new Error(`Claude API error: ${res.status}`)
+  const data = await res.json<{ content: Array<{ text: string }> }>()
+  return data.content[0]?.text ?? ''
+}
+
+function parseJson<T>(text: string): T {
+  const match = text.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error('Claude response missing JSON')
+  return JSON.parse(match[0]) as T
 }
 
 export async function generatePersonality(
@@ -979,33 +1138,15 @@ Write a witty music personality label (3-5 words, like "The Harsh Critic" or "Th
 
 Respond in JSON: { "label": "...", "roast": "..." }`
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 200,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  })
-  if (!res.ok) throw new Error(`Claude API error: ${res.status}`)
-  const data = await res.json<{ content: Array<{ text: string }> }>()
-  const text = data.content[0].text
-  const match = text.match(/\{[\s\S]*\}/)
-  if (!match) throw new Error('Claude response missing JSON')
-  return JSON.parse(match[0]) as PersonalityResult
+  return parseJson<PersonalityResult>(await callClaude(prompt, apiKey, 200))
 }
 
 export async function generateGroupTaste(
-  songs: { title: string; artist: string; averageScore: number; audioFeatures?: { energy: number; danceability: number; valence: number; tempo: number } }[],
+  songs: { title: string; artist: string; averageScore: number }[],
   apiKey: string
 ): Promise<GroupTasteResult> {
-  const topSongs = songs.sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
-  const bottomSongs = songs.sort((a, b) => a.averageScore - b.averageScore).slice(0, 3)
+  const topSongs = [...songs].sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
+  const bottomSongs = [...songs].sort((a, b) => a.averageScore - b.averageScore).slice(0, 3)
 
   const prompt = `You are summarizing a road trip group's music taste based on their ratings.
 
@@ -1015,29 +1156,11 @@ ${topSongs.map(s => `- "${s.title}" by ${s.artist} (avg ${s.averageScore.toFixed
 Least loved songs (the hall of shame):
 ${bottomSongs.map(s => `- "${s.title}" by ${s.artist} (avg ${s.averageScore.toFixed(1)}/5)`).join('\n')}
 
-Write a fun 1-sentence group taste summary, identify a top genre (make your best guess from artist/song names), and describe the vibe (e.g. "High energy, danceable" or "Chill and nostalgic").
+From the song titles and artists, infer the group's taste. Write a fun 1-sentence group taste summary, a best-guess top genre, and a short vibe descriptor (e.g. "High energy, danceable" or "Chill and nostalgic").
 
 Respond in JSON: { "summary": "...", "topGenre": "...", "vibe": "..." }`
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 150,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  })
-  if (!res.ok) throw new Error(`Claude API error: ${res.status}`)
-  const data = await res.json<{ content: Array<{ text: string }> }>()
-  const text = data.content[0].text
-  const match = text.match(/\{[\s\S]*\}/)
-  if (!match) throw new Error('Claude response missing JSON')
-  return JSON.parse(match[0]) as GroupTasteResult
+  return parseJson<GroupTasteResult>(await callClaude(prompt, apiKey, 150))
 }
 ```
 
@@ -1045,12 +1168,12 @@ Respond in JSON: { "summary": "...", "topGenre": "...", "vibe": "..." }`
 
 ```bash
 git add worker/src/claude.ts
-git commit -m "feat: Claude API client for personality and group taste generation" && git push && gh issue close 5
+git commit -m "feat: Claude client — personality + group taste inferred from titles/artists/scores" && git push && gh issue close 5
 ```
 
 ---
 
-## Task 6: Durable Object — WebSocket Hub
+## Task 6: Durable Object — WebSocket Hub + Direct D1 Writes
 
 **GitHub issue:** #6 — close with `gh issue close 6` at session end
 
@@ -1064,28 +1187,24 @@ ls worker/src/claude.ts worker/src/spotify.ts worker/src/db.ts worker/src/utils.
 
 The Durable Object is the heart of the app. It:
 1. Holds WebSocket connections for all participants
-2. Runs Spotify polling via alarms every 5 seconds
+2. Runs Spotify polling via alarms every 5 seconds, using the **trip's own** refresh token read from D1
 3. Manages rating windows (opens on new song, closes at 2 min, broadcasts reveal)
-4. Persists its own state (current song, window end time, access token, ratings received)
+4. **Writes songs and ratings directly to D1** via `this.env.DB` — no Worker bridge
+5. Persists its live state (current song, window end time, ratings received) in DO storage
 
 - [ ] **Step 1: Implement TripRoom Durable Object**
 
 ```typescript
 // worker/src/TripRoom.ts
 import { refreshAccessToken, fetchCurrentlyPlaying } from './spotify'
-import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo } from './types'
+import { createSong, upsertRating, getTripById } from './db'
 import { generateId } from './utils'
+import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState } from './types'
 
 const RATING_WINDOW_MS = 2 * 60 * 1000  // 2 minutes
 const POLL_INTERVAL_MS = 5 * 1000        // 5 seconds
 const EMOJI_SCORES: Record<string, number> = {
   '🔥': 5, '❤️': 4, '😐': 3, '😬': 2, '💀': 1,
-}
-
-interface Connection {
-  socket: WebSocket
-  participantId: string
-  participantName: string
 }
 
 interface RatingEntry {
@@ -1095,28 +1214,37 @@ interface RatingEntry {
   score: number
 }
 
+interface Attachment {
+  participantId: string
+  participantName: string
+  tripId: string
+}
+
 export class TripRoom implements DurableObject {
-  private connections = new Map<string, Connection>()  // participantId → Connection
   private accessToken: string | null = null
   private tokenExpiresAt = 0
 
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env
-  ) {
-    this.ctx.blockConcurrencyWhile(async () => {
-      // Restore connections count is not possible across cold starts — sockets are gone.
-      // All persistent state lives in storage.
-    })
-  }
+  ) {}
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
 
-    if (url.pathname === '/ws') {
-      return this.handleWebSocket(request)
+    if (url.pathname === '/ws') return this.handleWebSocket(request)
+
+    if (url.pathname === '/init') {
+      await this.initTrip(
+        url.searchParams.get('tripId') ?? '',
+        url.searchParams.get('name') ?? '',
+        url.searchParams.get('code') ?? ''
+      )
+      return new Response('OK')
     }
+
     if (url.pathname === '/start-polling') {
+      this.accessToken = null  // force token re-read now that DJ may have connected
       await this.ensurePolling()
       return new Response('OK')
     }
@@ -1125,37 +1253,35 @@ export class TripRoom implements DurableObject {
   }
 
   private async handleWebSocket(request: Request): Promise<Response> {
-    const upgrade = request.headers.get('Upgrade')
-    if (upgrade !== 'websocket') return new Response('Expected WebSocket', { status: 426 })
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 })
+    }
 
     const url = new URL(request.url)
-    const participantId = url.searchParams.get('participantId') ?? ''
-    const participantName = url.searchParams.get('participantName') ?? 'Anonymous'
-    const tripId = url.searchParams.get('tripId') ?? ''
+    const attachment: Attachment = {
+      participantId: url.searchParams.get('participantId') ?? '',
+      participantName: url.searchParams.get('participantName') ?? 'Anonymous',
+      tripId: url.searchParams.get('tripId') ?? '',
+    }
 
     const { 0: client, 1: server } = new WebSocketPair()
     this.ctx.acceptWebSocket(server)
+    server.serializeAttachment(attachment)
 
-    // Store metadata on the WebSocket for retrieval in message handlers
-    server.serializeAttachment({ participantId, participantName, tripId })
-
-    // Send current state to the new participant
-    const state = await this.buildStateForParticipant(participantId, tripId)
+    const state = await this.buildState(attachment.participantId, attachment.tripId)
     this.send(server, { type: 'state_sync', state })
 
-    // Notify others
     this.broadcast(
-      { type: 'participant_joined', participant: { id: participantId, name: participantName } },
-      participantId
+      { type: 'participant_joined', participant: { id: attachment.participantId, name: attachment.participantName } },
+      attachment.participantId
     )
 
     await this.ensurePolling()
-
     return new Response(null, { status: 101, webSocket: client })
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const attachment = ws.deserializeAttachment() as { participantId: string; participantName: string; tripId: string }
+    const att = ws.deserializeAttachment() as Attachment
     let msg: ClientMessage
     try {
       msg = JSON.parse(typeof message === 'string' ? message : new TextDecoder().decode(message))
@@ -1164,73 +1290,67 @@ export class TripRoom implements DurableObject {
     }
 
     if (msg.type === 'ping') {
-      this.send(ws, { type: 'error', message: 'pong' })  // reuse error type for simplicity; frontend ignores
+      this.send(ws, { type: 'pong' })
       return
     }
-
     if (msg.type === 'rate') {
-      await this.handleRating(attachment.participantId, attachment.participantName, attachment.tripId, msg)
+      await this.handleRating(att.participantId, att.participantName, msg)
     }
   }
 
-  async webSocketClose(ws: WebSocket): Promise<void> {
-    // Nothing to clean up — connections map is in-memory and cleared on cold start
+  async webSocketClose(): Promise<void> {
+    // Connections are tracked by the runtime via getWebSockets(); nothing to clean up.
   }
 
-  async webSocketError(ws: WebSocket): Promise<void> {
-    // Socket errors are handled silently
+  async webSocketError(): Promise<void> {
+    // Socket errors handled silently.
   }
 
   private async handleRating(
     participantId: string,
     participantName: string,
-    tripId: string,
     msg: Extract<ClientMessage, { type: 'rate' }>
   ): Promise<void> {
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
     const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-
     if (!currentSong || currentSong.id !== msg.songId) return
     if (!windowEndsAt || Date.now() > windowEndsAt) return
 
-    // Upsert rating in storage
+    const score = EMOJI_SCORES[msg.emoji]
+    if (!score) return
+
+    // Live state for fast X/N counting
     const ratingsKey = `ratings:${msg.songId}`
     const ratings = (await this.ctx.storage.get<Record<string, RatingEntry>>(ratingsKey)) ?? {}
-    ratings[participantId] = {
-      participantId,
-      participantName,
-      emoji: msg.emoji,
-      score: EMOJI_SCORES[msg.emoji] ?? 3,
-    }
+    ratings[participantId] = { participantId, participantName, emoji: msg.emoji, score }
     await this.ctx.storage.put(ratingsKey, ratings)
 
-    // Also persist to D1 via the Worker (we don't have DB binding in DO — pass via fetch)
-    // D1 writes happen in the Worker's rating endpoint instead
+    // Source of truth — persist directly to D1
+    await upsertRating(this.env.DB, {
+      id: generateId(),
+      song_id: msg.songId,
+      participant_id: participantId,
+      emoji: msg.emoji,
+      score,
+    })
 
-    // Count how many participants have rated
-    const sockets = this.ctx.getWebSockets()
-    const totalCount = sockets.length
-    const ratedCount = Object.keys(ratings).length
-
-    this.broadcastAll({ type: 'rating_update', ratedCount, totalCount })
+    this.broadcastAll({
+      type: 'rating_update',
+      ratedCount: Object.keys(ratings).length,
+      totalCount: this.ctx.getWebSockets().length,
+    })
   }
 
   async alarm(): Promise<void> {
     const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-
-    // Check if rating window has closed
     if (windowEndsAt && Date.now() >= windowEndsAt) {
       await this.revealRatings()
     }
-
-    // Poll Spotify for currently playing
     try {
       await this.pollSpotify()
     } catch (e) {
       console.error('Spotify poll error:', e)
     }
-
-    // Schedule next poll
     await this.ctx.storage.setAlarm(Date.now() + POLL_INTERVAL_MS)
   }
 
@@ -1238,29 +1358,12 @@ export class TripRoom implements DurableObject {
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
     if (!currentSong) return
 
-    const ratingsKey = `ratings:${currentSong.id}`
-    const ratings = (await this.ctx.storage.get<Record<string, RatingEntry>>(ratingsKey)) ?? {}
-
-    const ratingList: RatingInfo[] = Object.values(ratings).map(r => ({
-      participantId: r.participantId,
-      participantName: r.participantName,
-      emoji: r.emoji,
-      score: r.score,
-    }))
-
+    const ratings = (await this.ctx.storage.get<Record<string, RatingEntry>>(`ratings:${currentSong.id}`)) ?? {}
+    const ratingList: RatingInfo[] = Object.values(ratings)
     const averageScore =
-      ratingList.length > 0
-        ? ratingList.reduce((sum, r) => sum + r.score, 0) / ratingList.length
-        : 0
+      ratingList.length > 0 ? ratingList.reduce((s, r) => s + r.score, 0) / ratingList.length : 0
 
-    this.broadcastAll({
-      type: 'rating_reveal',
-      songId: currentSong.id,
-      ratings: ratingList,
-      averageScore,
-    })
-
-    // Clear window — keep currentSong set so late-joiner state_sync knows last song
+    this.broadcastAll({ type: 'rating_reveal', songId: currentSong.id, ratings: ratingList, averageScore })
     await this.ctx.storage.delete('windowEndsAt')
   }
 
@@ -1273,67 +1376,69 @@ export class TripRoom implements DurableObject {
 
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
     const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+    const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
 
-    // Same song still playing and window is open — do nothing
-    if (currentSong?.spotifyTrackId === track.id && windowEndsAt && Date.now() < windowEndsAt) return
+    if (windowOpen) return                                  // window still open — nothing to do
+    if (currentSong?.spotifyTrackId === track.id) return    // same track, window closed — wait for a change
 
-    // New song detected and no active window
-    if (!windowEndsAt || Date.now() >= windowEndsAt) {
-      if (currentSong?.spotifyTrackId === track.id) return  // same song, window closed, waiting
+    const tripId = await this.ctx.storage.get<string>('tripId')
+    if (!tripId) return
 
-      // New song!
-      const songId = await this.ctx.storage.get<string>(`songDbId:${track.id}`)
-      if (!songId) return  // Worker hasn't persisted this song yet — skip until it does
+    // New song — persist to D1, open a window, broadcast
+    const song = await createSong(this.env.DB, {
+      id: generateId(),
+      trip_id: tripId,
+      spotify_track_id: track.id,
+      title: track.title,
+      artist: track.artist,
+      album_art: track.album_art,
+    })
 
-      const newSong: SongInfo = {
-        id: songId,
-        spotifyTrackId: track.id,
-        title: track.title,
-        artist: track.artist,
-        albumArt: track.album_art,
-      }
-
-      const windowEnd = Date.now() + RATING_WINDOW_MS
-      await this.ctx.storage.put('currentSong', newSong)
-      await this.ctx.storage.put('windowEndsAt', windowEnd)
-      await this.ctx.storage.delete(`ratings:${songId}`)
-
-      const sockets = this.ctx.getWebSockets()
-      this.broadcastAll({
-        type: 'song_started',
-        song: newSong,
-        windowEndsAt: windowEnd,
-        participantCount: sockets.length,
-      })
+    const newSong: SongInfo = {
+      id: song.id,
+      spotifyTrackId: track.id,
+      title: track.title,
+      artist: track.artist,
+      albumArt: track.album_art,
     }
-  }
+    const windowEnd = Date.now() + RATING_WINDOW_MS
+    await this.ctx.storage.put('currentSong', newSong)
+    await this.ctx.storage.put('windowEndsAt', windowEnd)
+    await this.ctx.storage.delete(`ratings:${song.id}`)
 
-  async registerSong(songDbId: string, spotifyTrackId: string): Promise<void> {
-    await this.ctx.storage.put(`songDbId:${spotifyTrackId}`, songDbId)
+    this.broadcastAll({
+      type: 'song_started',
+      song: newSong,
+      windowEndsAt: windowEnd,
+      participantCount: this.ctx.getWebSockets().length,
+    })
   }
 
   private async getAccessToken(): Promise<string | null> {
-    if (this.accessToken && Date.now() < this.tokenExpiresAt - 60_000) {
-      return this.accessToken
-    }
+    if (this.accessToken && Date.now() < this.tokenExpiresAt - 60_000) return this.accessToken
+    const tripId = await this.ctx.storage.get<string>('tripId')
+    if (!tripId) return null
+    const trip = await getTripById(this.env.DB, tripId)
+    if (!trip?.spotify_refresh_token) return null
     try {
       this.accessToken = await refreshAccessToken(
         this.env.SPOTIFY_CLIENT_ID,
         this.env.SPOTIFY_CLIENT_SECRET,
-        this.env.SPOTIFY_REFRESH_TOKEN
+        trip.spotify_refresh_token
       )
-      this.tokenExpiresAt = Date.now() + 3_600_000  // 1 hour
+      this.tokenExpiresAt = Date.now() + 3_600_000
       return this.accessToken
     } catch {
       return null
     }
   }
 
-  private async buildStateForParticipant(participantId: string, tripId: string): Promise<import('./types').TripState> {
-    const currentSong = await this.ctx.storage.get<SongInfo>('currentSong') ?? null
-    const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt') ?? null
-    const tripName = await this.ctx.storage.get<string>('tripName') ?? ''
-    const shortCode = await this.ctx.storage.get<string>('shortCode') ?? ''
+  private async buildState(participantId: string, tripId: string): Promise<TripState> {
+    const currentSong = (await this.ctx.storage.get<SongInfo>('currentSong')) ?? null
+    const windowEndsAt = (await this.ctx.storage.get<number>('windowEndsAt')) ?? null
+    const tripName = (await this.ctx.storage.get<string>('tripName')) ?? ''
+    const shortCode = (await this.ctx.storage.get<string>('shortCode')) ?? ''
+    const trip = await getTripById(this.env.DB, tripId)
 
     let myRating: string | null = null
     let ratedCount = 0
@@ -1343,14 +1448,13 @@ export class TripRoom implements DurableObject {
       myRating = ratings[participantId]?.emoji ?? null
     }
 
-    const sockets = this.ctx.getWebSockets()
-
     return {
       tripId,
       tripName,
       shortCode,
-      participants: sockets.map(s => {
-        const att = s.deserializeAttachment() as { participantId: string; participantName: string }
+      djConnected: !!trip?.spotify_refresh_token,
+      participants: this.ctx.getWebSockets().map(s => {
+        const att = s.deserializeAttachment() as Attachment
         return { id: att.participantId, name: att.participantName }
       }),
       currentSong,
@@ -1360,38 +1464,30 @@ export class TripRoom implements DurableObject {
     }
   }
 
-  async initTrip(tripName: string, shortCode: string): Promise<void> {
+  private async initTrip(tripId: string, tripName: string, shortCode: string): Promise<void> {
+    await this.ctx.storage.put('tripId', tripId)
     await this.ctx.storage.put('tripName', tripName)
     await this.ctx.storage.put('shortCode', shortCode)
   }
 
   private async ensurePolling(): Promise<void> {
-    const alarm = await this.ctx.storage.getAlarm()
-    if (!alarm) {
+    if (!(await this.ctx.storage.getAlarm())) {
       await this.ctx.storage.setAlarm(Date.now() + POLL_INTERVAL_MS)
     }
   }
 
   private send(ws: WebSocket, msg: ServerMessage): void {
-    try {
-      ws.send(JSON.stringify(msg))
-    } catch {
-      // Socket may be closed
-    }
+    try { ws.send(JSON.stringify(msg)) } catch { /* socket closed */ }
   }
 
   private broadcastAll(msg: ServerMessage): void {
-    for (const ws of this.ctx.getWebSockets()) {
-      this.send(ws, msg)
-    }
+    for (const ws of this.ctx.getWebSockets()) this.send(ws, msg)
   }
 
   private broadcast(msg: ServerMessage, excludeParticipantId?: string): void {
     for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as { participantId: string }
-      if (att.participantId !== excludeParticipantId) {
-        this.send(ws, msg)
-      }
+      const att = ws.deserializeAttachment() as Attachment
+      if (att.participantId !== excludeParticipantId) this.send(ws, msg)
     }
   }
 }
@@ -1401,12 +1497,12 @@ export class TripRoom implements DurableObject {
 
 ```bash
 git add worker/src/TripRoom.ts
-git commit -m "feat: TripRoom Durable Object — WebSocket hub, Spotify polling, rating window" && git push && gh issue close 6
+git commit -m "feat: TripRoom DO — WS hub, Spotify polling, direct D1 song/rating writes" && git push && gh issue close 6
 ```
 
 ---
 
-## Task 7: Worker Entry Point & API Routes
+## Task 7: Worker Entry Point, API Routes & Spotify OAuth
 
 **GitHub issue:** #7 — close with `gh issue close 7` at session end
 
@@ -1418,68 +1514,47 @@ ls worker/src/TripRoom.ts worker/src/claude.ts worker/src/spotify.ts worker/src/
 **Files:**
 - Create: `worker/src/index.ts`
 
-The Worker handles:
-- `GET /` and all non-API routes → serve React app from static assets
-- `POST /api/trips` → create trip
-- `GET /api/trips/:code` → get trip by short code
+The Worker handles (all same-origin — no CORS needed):
+- `GET /` and non-API routes → serve React app from static assets
+- `POST /api/trips` → create trip (no token yet) + init the DO
+- `GET /api/trips/:code` → get trip (returns `creator_name`, `djConnected`; never the token)
 - `POST /api/trips/:code/join` → create participant
-- `GET /api/trips/:code/leaderboard` → songs + ratings + scores
-- `POST /api/trips/:code/songs` → persist newly detected song (called from Durable Object poll via internal fetch)
-- `POST /api/trips/:code/rate` → persist a rating to D1
-- `GET /api/trips/:code/analysis` → generate Claude analysis (unlocks at 10 songs)
+- `GET /api/trips/:code/leaderboard` → songs + ratings + scores (single JOIN)
+- `GET /api/trips/:code/analysis` → cached Claude analysis (unlocks at 10 rated songs)
+- `GET /api/spotify/login?tripId=...` → 302 redirect to Spotify authorize
+- `GET /api/spotify/callback?code=...&state=tripId` → exchange code, store token, start DO polling, redirect to trip
 - `GET /ws?tripId=...&participantId=...&participantName=...` → upgrade to DO WebSocket
+
+There is **no** `/songs`, `/register-song`, or `/rate` route — the DO owns those writes.
 
 - [ ] **Step 1: Implement Worker entry point**
 
 ```typescript
 // worker/src/index.ts
 import { TripRoom } from './TripRoom'
-import { createTrip, getTripByCode, createParticipant, createSong, upsertRating, getSongsWithRatings, getParticipants, updateSongAudioFeatures } from './db'
+import {
+  createTrip, getTripByCode, getTripById, createParticipant,
+  getParticipants, getLeaderboard, getAnalysisCache, setAnalysisCache, setTripSpotifyToken,
+} from './db'
 import { generateShortCode, generateId, json, err } from './utils'
-import { fetchAudioFeatures, refreshAccessToken } from './spotify'
+import { exchangeCodeForToken } from './spotify'
 import { generatePersonality, generateGroupTaste } from './claude'
 import type { Env } from './types'
 
 export { TripRoom }
 
+const SPOTIFY_SCOPES = 'user-read-currently-playing user-read-playback-state'
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
-    const method = request.method
 
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    }
+    if (url.pathname === '/ws') return handleWebSocket(request, env)
+    if (url.pathname === '/api/spotify/login') return spotifyLogin(url, env)
+    if (url.pathname === '/api/spotify/callback') return spotifyCallback(url, env)
+    if (url.pathname.startsWith('/api/')) return handleApi(url, request.method, request, env)
 
-    if (method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders })
-    }
-
-    const addCors = (res: Response) => {
-      const headers = new Headers(res.headers)
-      Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v))
-      return new Response(res.body, { status: res.status, headers })
-    }
-
-    const handle = async () => {
-      // WebSocket upgrade
-      if (url.pathname === '/ws') {
-        return handleWebSocket(request, env)
-      }
-
-      // API routes
-      if (url.pathname.startsWith('/api/')) {
-        return handleApi(url, method, request, env)
-      }
-
-      // Static assets (React app)
-      return env.ASSETS.fetch(request)
-    }
-
-    return handle().then(addCors)
+    return env.ASSETS.fetch(request)
   },
 }
 
@@ -1487,56 +1562,52 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url)
   const tripId = url.searchParams.get('tripId')
   if (!tripId) return err('tripId required', 400)
-
-  const id = env.TRIP_ROOM.idFromName(tripId)
-  const stub = env.TRIP_ROOM.get(id)
-
-  // Forward to Durable Object
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(tripId))
   const doUrl = new URL(request.url)
   doUrl.pathname = '/ws'
   return stub.fetch(new Request(doUrl, request))
 }
 
+function spotifyLogin(url: URL, env: Env): Response {
+  const tripId = url.searchParams.get('tripId')
+  if (!tripId) return err('tripId required')
+  const redirectUri = `${url.origin}/api/spotify/callback`
+  const authUrl = new URL('https://accounts.spotify.com/authorize')
+  authUrl.searchParams.set('client_id', env.SPOTIFY_CLIENT_ID)
+  authUrl.searchParams.set('response_type', 'code')
+  authUrl.searchParams.set('redirect_uri', redirectUri)
+  authUrl.searchParams.set('scope', SPOTIFY_SCOPES)
+  authUrl.searchParams.set('state', tripId)
+  return Response.redirect(authUrl.toString(), 302)
+}
+
+async function spotifyCallback(url: URL, env: Env): Promise<Response> {
+  const code = url.searchParams.get('code')
+  const tripId = url.searchParams.get('state')
+  if (!code || !tripId) return err('invalid callback')
+
+  const trip = await getTripById(env.DB, tripId)
+  if (!trip) return err('Trip not found', 404)
+
+  const redirectUri = `${url.origin}/api/spotify/callback`
+  const tokens = await exchangeCodeForToken(env.SPOTIFY_CLIENT_ID, env.SPOTIFY_CLIENT_SECRET, code, redirectUri)
+  await setTripSpotifyToken(env.DB, tripId, tokens.refresh_token)
+
+  // Kick the DO to re-read the token and start polling
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(tripId))
+  await stub.fetch('https://do/start-polling', { method: 'POST' })
+
+  return Response.redirect(`${url.origin}/trip/${trip.short_code}`, 302)
+}
+
 async function handleApi(url: URL, method: string, request: Request, env: Env): Promise<Response> {
   const parts = url.pathname.replace('/api/', '').split('/')
-  // /api/trips → ['trips']
-  // /api/trips/ABC123 → ['trips', 'ABC123']
-  // /api/trips/ABC123/join → ['trips', 'ABC123', 'join']
 
-  // POST /api/trips — create trip
-  if (parts[0] === 'trips' && !parts[1] && method === 'POST') {
-    return createTripHandler(request, env)
-  }
-
-  // GET /api/trips/:code — get trip info
-  if (parts[0] === 'trips' && parts[1] && !parts[2] && method === 'GET') {
-    return getTripHandler(parts[1], env)
-  }
-
-  // POST /api/trips/:code/join — join trip
-  if (parts[0] === 'trips' && parts[1] && parts[2] === 'join' && method === 'POST') {
-    return joinTripHandler(parts[1], request, env)
-  }
-
-  // GET /api/trips/:code/leaderboard — get songs with ratings
-  if (parts[0] === 'trips' && parts[1] && parts[2] === 'leaderboard' && method === 'GET') {
-    return leaderboardHandler(parts[1], env)
-  }
-
-  // POST /api/trips/:code/songs — persist a newly detected song + start DO window
-  if (parts[0] === 'trips' && parts[1] && parts[2] === 'songs' && method === 'POST') {
-    return persistSongHandler(parts[1], request, env)
-  }
-
-  // POST /api/trips/:code/rate — persist a rating to D1
-  if (parts[0] === 'trips' && parts[1] && parts[2] === 'rate' && method === 'POST') {
-    return rateHandler(parts[1], request, env)
-  }
-
-  // GET /api/trips/:code/analysis — generate analysis (min 10 songs)
-  if (parts[0] === 'trips' && parts[1] && parts[2] === 'analysis' && method === 'GET') {
-    return analysisHandler(parts[1], env)
-  }
+  if (parts[0] === 'trips' && !parts[1] && method === 'POST') return createTripHandler(request, env)
+  if (parts[0] === 'trips' && parts[1] && !parts[2] && method === 'GET') return getTripHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'join' && method === 'POST') return joinTripHandler(parts[1], request, env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'leaderboard' && method === 'GET') return leaderboardHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'analysis' && method === 'GET') return analysisHandler(parts[1], env)
 
   return err('Not found', 404)
 }
@@ -1546,197 +1617,127 @@ async function createTripHandler(request: Request, env: Env): Promise<Response> 
   if (!body.name?.trim()) return err('name required')
   if (!body.creatorName?.trim()) return err('creatorName required')
 
-  const id = generateId()
-  const shortCode = generateShortCode()
-
   const trip = await createTrip(env.DB, {
-    id,
+    id: generateId(),
     name: body.name.trim(),
-    short_code: shortCode,
+    short_code: generateShortCode(),
     creator_name: body.creatorName.trim(),
     spotify_refresh_token: null,
   })
 
-  // Init the Durable Object with trip metadata
-  const doId = env.TRIP_ROOM.idFromName(trip.id)
-  const stub = env.TRIP_ROOM.get(doId)
-  await stub.fetch(new Request(`https://do/init?name=${encodeURIComponent(trip.name)}&code=${encodeURIComponent(trip.short_code)}&tripId=${trip.id}`, { method: 'POST' }))
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
+  await stub.fetch(
+    `https://do/init?tripId=${trip.id}&name=${encodeURIComponent(trip.name)}&code=${encodeURIComponent(trip.short_code)}`,
+    { method: 'POST' }
+  )
 
-  return json({ trip })
+  return json({ trip: { ...trip, spotify_refresh_token: undefined } })
 }
 
 async function getTripHandler(code: string, env: Env): Promise<Response> {
   const trip = await getTripByCode(env.DB, code.toUpperCase())
   if (!trip) return err('Trip not found', 404)
-  return json({ trip: { ...trip, spotify_refresh_token: undefined } })
+  return json({
+    trip: {
+      id: trip.id,
+      name: trip.name,
+      short_code: trip.short_code,
+      creator_name: trip.creator_name,
+      created_at: trip.created_at,
+      djConnected: !!trip.spotify_refresh_token,
+    },
+  })
 }
 
 async function joinTripHandler(code: string, request: Request, env: Env): Promise<Response> {
   const trip = await getTripByCode(env.DB, code.toUpperCase())
   if (!trip) return err('Trip not found', 404)
-
   const body = await request.json<{ name: string }>()
   if (!body.name?.trim()) return err('name required')
-
-  const participant = await createParticipant(env.DB, {
-    id: generateId(),
-    trip_id: trip.id,
-    name: body.name.trim(),
-  })
-
+  const participant = await createParticipant(env.DB, { id: generateId(), trip_id: trip.id, name: body.name.trim() })
   return json({ participant, tripId: trip.id })
 }
 
 async function leaderboardHandler(code: string, env: Env): Promise<Response> {
   const trip = await getTripByCode(env.DB, code.toUpperCase())
   if (!trip) return err('Trip not found', 404)
-
-  const songsWithRatings = await getSongsWithRatings(env.DB, trip.id)
-  const sorted = songsWithRatings
+  const songs = await getLeaderboard(env.DB, trip.id)
+  const sorted = songs
     .filter(s => s.ratings.length > 0)
+    .map(s => ({
+      song: {
+        id: s.song.id,
+        title: s.song.title,
+        artist: s.song.artist,
+        albumArt: s.song.album_art,
+        identified_at: s.song.identified_at,
+      },
+      ratings: s.ratings.map(r => ({
+        participantId: r.participant_id,
+        participantName: r.participant_name,
+        emoji: r.emoji,
+        score: r.score,
+      })),
+      averageScore: s.averageScore,
+    }))
     .sort((a, b) => b.averageScore - a.averageScore)
-
   return json({ songs: sorted })
-}
-
-async function persistSongHandler(code: string, request: Request, env: Env): Promise<Response> {
-  const trip = await getTripByCode(env.DB, code.toUpperCase())
-  if (!trip) return err('Trip not found', 404)
-
-  const body = await request.json<{ spotifyTrackId: string; title: string; artist: string; albumArt: string | null }>()
-
-  const song = await createSong(env.DB, {
-    id: generateId(),
-    trip_id: trip.id,
-    spotify_track_id: body.spotifyTrackId,
-    title: body.title,
-    artist: body.artist,
-    album_art: body.albumArt,
-    audio_features: null,
-  })
-
-  // Register song ID in Durable Object so it can broadcast song_started
-  const doId = env.TRIP_ROOM.idFromName(trip.id)
-  const stub = env.TRIP_ROOM.get(doId)
-  await stub.fetch(
-    new Request(`https://do/register-song?songDbId=${song.id}&spotifyTrackId=${body.spotifyTrackId}`, { method: 'POST' })
-  )
-
-  // Fetch and store audio features in the background
-  const ctx = { waitUntil: (p: Promise<unknown>) => p } // minimal ctx for background work
-  enrichAudioFeatures(song.id, body.spotifyTrackId, trip.id, env).catch(console.error)
-
-  return json({ song })
-}
-
-async function enrichAudioFeatures(songId: string, trackId: string, _tripId: string, env: Env): Promise<void> {
-  try {
-    const token = await refreshAccessToken(env.SPOTIFY_CLIENT_ID, env.SPOTIFY_CLIENT_SECRET, env.SPOTIFY_REFRESH_TOKEN)
-    const features = await fetchAudioFeatures(trackId, token)
-    if (features) {
-      await updateSongAudioFeatures(env.DB, songId, JSON.stringify(features))
-    }
-  } catch {
-    // Non-critical, ignore
-  }
-}
-
-async function rateHandler(code: string, request: Request, env: Env): Promise<Response> {
-  const trip = await getTripByCode(env.DB, code.toUpperCase())
-  if (!trip) return err('Trip not found', 404)
-
-  const body = await request.json<{ songId: string; participantId: string; emoji: string; score: number }>()
-  if (!body.songId || !body.participantId || !body.emoji) return err('songId, participantId, emoji required')
-
-  await upsertRating(env.DB, {
-    id: generateId(),
-    song_id: body.songId,
-    participant_id: body.participantId,
-    emoji: body.emoji,
-    score: body.score,
-  })
-
-  return json({ ok: true })
 }
 
 async function analysisHandler(code: string, env: Env): Promise<Response> {
   const trip = await getTripByCode(env.DB, code.toUpperCase())
   if (!trip) return err('Trip not found', 404)
 
-  const songsWithRatings = await getSongsWithRatings(env.DB, trip.id)
-  const ratedSongs = songsWithRatings.filter(s => s.ratings.length > 0)
-
+  const leaderboard = await getLeaderboard(env.DB, trip.id)
+  const ratedSongs = leaderboard.filter(s => s.ratings.length > 0)
   if (ratedSongs.length < 10) {
     return err(`Analysis unlocks after 10 rated songs (${ratedSongs.length}/10)`, 403)
   }
 
-  const participants = await getParticipants(env.DB, trip.id)
+  // Serve from cache if the rated-song count hasn't changed
+  const cached = await getAnalysisCache(env.DB, trip.id)
+  if (cached && cached.rated_songs_count === ratedSongs.length) {
+    return new Response(cached.payload, { headers: { 'Content-Type': 'application/json' } })
+  }
 
-  // Build per-person rating patterns
-  const personalities = await Promise.all(
-    participants.map(async p => {
-      const ratingsGiven = ratedSongs.flatMap(s =>
-        s.ratings
-          .filter(r => r.participant_id === p.id)
-          .map(r => ({ emoji: r.emoji, score: r.score, songTitle: s.song.title, artist: s.song.artist }))
-      )
-      if (ratingsGiven.length === 0) return null
-      const avgScore = ratingsGiven.reduce((sum, r) => sum + r.score, 0) / ratingsGiven.length
-      const personality = await generatePersonality(
-        { participantName: p.name, ratingsGiven, averageScore: avgScore },
-        env.CLAUDE_API_KEY
-      )
-      return { participant: p, personality, averageScore: avgScore }
-    })
-  )
+  const participants = await getParticipants(env.DB, trip.id)
+  const personalities = (
+    await Promise.all(
+      participants.map(async p => {
+        const ratingsGiven = ratedSongs.flatMap(s =>
+          s.ratings
+            .filter(r => r.participant_id === p.id)
+            .map(r => ({ emoji: r.emoji, score: r.score, songTitle: s.song.title, artist: s.song.artist }))
+        )
+        if (ratingsGiven.length === 0) return null
+        const avg = ratingsGiven.reduce((sum, r) => sum + r.score, 0) / ratingsGiven.length
+        const personality = await generatePersonality(
+          { participantName: p.name, ratingsGiven, averageScore: avg },
+          env.CLAUDE_API_KEY
+        )
+        return { participant: { id: p.id, name: p.name }, personality, averageScore: avg }
+      })
+    )
+  ).filter(Boolean)
 
   const groupTaste = await generateGroupTaste(
-    ratedSongs.map(s => ({
-      title: s.song.title,
-      artist: s.song.artist,
-      averageScore: s.averageScore,
-      audioFeatures: s.song.audio_features ? JSON.parse(s.song.audio_features) : undefined,
-    })),
+    ratedSongs.map(s => ({ title: s.song.title, artist: s.song.artist, averageScore: s.averageScore })),
     env.CLAUDE_API_KEY
   )
 
-  return json({
-    personalities: personalities.filter(Boolean),
-    groupTaste,
-    ratedSongsCount: ratedSongs.length,
-  })
+  const payload = JSON.stringify({ personalities, groupTaste, ratedSongsCount: ratedSongs.length })
+  await setAnalysisCache(env.DB, trip.id, payload, ratedSongs.length)
+  return new Response(payload, { headers: { 'Content-Type': 'application/json' } })
 }
 ```
 
-- [ ] **Step 2: Add `/init` and `/register-song` routes to TripRoom**
-
-Add these handlers inside `TripRoom.fetch()`:
-
-```typescript
-// In TripRoom.ts — add inside fetch() after '/ws' check:
-
-if (url.pathname === '/init') {
-  const name = url.searchParams.get('name') ?? ''
-  const code = url.searchParams.get('code') ?? ''
-  await this.initTrip(name, code)
-  return new Response('OK')
-}
-
-if (url.pathname === '/register-song') {
-  const songDbId = url.searchParams.get('songDbId') ?? ''
-  const spotifyTrackId = url.searchParams.get('spotifyTrackId') ?? ''
-  await this.registerSong(songDbId, spotifyTrackId)
-  return new Response('OK')
-}
-```
-
-- [ ] **Step 3: Apply D1 schema to local dev**
+- [ ] **Step 2: Apply D1 schema to local dev**
 
 ```bash
 cd worker && npx wrangler d1 execute listening-road-trip --local --file=schema.sql
 ```
 
-- [ ] **Step 4: Test the Worker locally**
+- [ ] **Step 3: Smoke-test the Worker locally**
 
 ```bash
 cd worker && npx wrangler dev --local
@@ -1750,19 +1751,13 @@ curl -X POST http://localhost:8787/api/trips \
   -d '{"name":"Road Trip 1","creatorName":"Boaz"}'
 ```
 
-Expected: `{"trip":{"id":"...","name":"Road Trip 1","short_code":"XXXXXX","creator_name":"Boaz",...}}`
+Expected: `{"trip":{"id":"...","short_code":"XXXXXX",...}}`. Then `curl http://localhost:8787/api/trips/XXXXXX` returns the trip with `djConnected:false`.
+
+- [ ] **Step 4: Commit**
 
 ```bash
-curl http://localhost:8787/api/trips/XXXXXX
-```
-
-Expected: trip object returned.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add worker/src/index.ts worker/src/TripRoom.ts
-git commit -m "feat: Worker API routes — create/join trip, leaderboard, rating, analysis" && git push && gh issue close 7
+git add worker/src/index.ts
+git commit -m "feat: Worker routes — trips, leaderboard, cached analysis, Spotify OAuth, WS upgrade" && git push && gh issue close 7
 ```
 
 ---
@@ -1774,7 +1769,6 @@ git commit -m "feat: Worker API routes — create/join trip, leaderboard, rating
 **Prerequisites:** Task 7 complete. Verify the Worker starts cleanly:
 ```bash
 ls worker/src/index.ts
-cd worker && npx wrangler dev --local  # should start without errors, Ctrl+C to stop
 ```
 
 **Files:**
@@ -1805,6 +1799,7 @@ export interface TripState {
   tripId: string
   tripName: string
   shortCode: string
+  djConnected: boolean
   participants: { id: string; name: string }[]
   currentSong: SongInfo | null
   windowEndsAt: number | null
@@ -1818,16 +1813,14 @@ export type ServerMessage =
   | { type: 'song_started'; song: SongInfo; windowEndsAt: number; participantCount: number }
   | { type: 'rating_update'; ratedCount: number; totalCount: number }
   | { type: 'rating_reveal'; songId: string; ratings: RatingInfo[]; averageScore: number }
-  | { type: 'error'; message: string }
+  | { type: 'pong' }
+
+export type ClientMessage =
+  | { type: 'ping' }
+  | { type: 'rate'; songId: string; emoji: string; score: number }
 
 export interface LeaderboardEntry {
-  song: {
-    id: string
-    title: string
-    artist: string
-    albumArt: string | null
-    identified_at: number
-  }
+  song: { id: string; title: string; artist: string; albumArt: string | null; identified_at: number }
   ratings: RatingInfo[]
   averageScore: number
 }
@@ -1864,14 +1857,14 @@ interface RevealedSong {
 }
 
 interface TripStore {
-  // Identity
   participantId: string | null
   participantName: string | null
   tripCode: string | null
 
-  // Trip state
   tripId: string | null
   tripName: string
+  shortCode: string
+  djConnected: boolean
   participants: { id: string; name: string }[]
   currentSong: SongInfo | null
   windowEndsAt: number | null
@@ -1880,7 +1873,6 @@ interface TripStore {
   myRating: string | null
   lastReveal: RevealedSong | null
 
-  // Actions
   setIdentity: (participantId: string, participantName: string, tripCode: string) => void
   applyStateSync: (state: TripState) => void
   addParticipant: (p: { id: string; name: string }) => void
@@ -1896,6 +1888,8 @@ export const useTripStore = create<TripStore>((set) => ({
   tripCode: null,
   tripId: null,
   tripName: '',
+  shortCode: '',
+  djConnected: false,
   participants: [],
   currentSong: null,
   windowEndsAt: null,
@@ -1911,6 +1905,8 @@ export const useTripStore = create<TripStore>((set) => ({
     set({
       tripId: state.tripId,
       tripName: state.tripName,
+      shortCode: state.shortCode,
+      djConnected: state.djConnected,
       participants: state.participants,
       currentSong: state.currentSong,
       windowEndsAt: state.windowEndsAt,
@@ -1920,22 +1916,20 @@ export const useTripStore = create<TripStore>((set) => ({
     }),
 
   addParticipant: (p) =>
-    set((s) => ({
-      participants: s.participants.some(x => x.id === p.id) ? s.participants : [...s.participants, p],
-      totalCount: s.participants.some(x => x.id === p.id) ? s.totalCount : s.totalCount + 1,
-    })),
+    set((s) => {
+      if (s.participants.some(x => x.id === p.id)) return s
+      return { participants: [...s.participants, p], totalCount: s.totalCount + 1 }
+    }),
 
   setSongStarted: (song, windowEndsAt, participantCount) =>
-    set({ currentSong: song, windowEndsAt, ratedCount: 0, totalCount: participantCount, myRating: null, lastReveal: null }),
+    set({ currentSong: song, windowEndsAt, ratedCount: 0, totalCount: participantCount, myRating: null, lastReveal: null, djConnected: true }),
 
-  setRatingUpdate: (ratedCount, totalCount) =>
-    set({ ratedCount, totalCount }),
+  setRatingUpdate: (ratedCount, totalCount) => set({ ratedCount, totalCount }),
 
   setReveal: (songId, ratings, averageScore) =>
     set({ lastReveal: { songId, ratings, averageScore }, windowEndsAt: null }),
 
-  setMyRating: (emoji) =>
-    set({ myRating: emoji }),
+  setMyRating: (emoji) => set({ myRating: emoji }),
 }))
 ```
 
@@ -1943,7 +1937,7 @@ export const useTripStore = create<TripStore>((set) => ({
 
 ```bash
 git add frontend/src/types.ts frontend/src/hooks/useTripStore.ts
-git commit -m "feat: frontend types and Zustand trip store" && git push && gh issue close 8
+git commit -m "feat: frontend types and Zustand trip store (djConnected, lastReveal)" && git push && gh issue close 8
 ```
 
 ---
@@ -1964,7 +1958,7 @@ ls frontend/src/types.ts frontend/src/hooks/useTripStore.ts
 
 ```typescript
 // frontend/src/hooks/useWebSocket.ts
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useState } from 'react'
 import { useTripStore } from './useTripStore'
 import type { ServerMessage, ClientMessage } from '../types'
 import { EMOJI_SCORES } from '../types'
@@ -1975,8 +1969,7 @@ export function useWebSocket(tripId: string | null, participantId: string | null
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isUnmounted = useRef(false)
-
-  const store = useTripStore()
+  const [isConnected, setIsConnected] = useState(false)
 
   const connect = useCallback(() => {
     if (!tripId || !participantId || !participantName) return
@@ -1987,36 +1980,27 @@ export function useWebSocket(tripId: string | null, participantId: string | null
 
     const ws = new WebSocket(url)
     wsRef.current = ws
+    const store = useTripStore.getState()
+
+    ws.onopen = () => setIsConnected(true)
 
     ws.onmessage = (event) => {
       let msg: ServerMessage
-      try {
-        msg = JSON.parse(event.data)
-      } catch {
-        return
-      }
-
-      if (msg.type === 'state_sync') {
-        store.applyStateSync(msg.state)
-      } else if (msg.type === 'participant_joined') {
-        store.addParticipant(msg.participant)
-      } else if (msg.type === 'song_started') {
-        store.setSongStarted(msg.song, msg.windowEndsAt, msg.participantCount)
-      } else if (msg.type === 'rating_update') {
-        store.setRatingUpdate(msg.ratedCount, msg.totalCount)
-      } else if (msg.type === 'rating_reveal') {
-        store.setReveal(msg.songId, msg.ratings, msg.averageScore)
-      }
+      try { msg = JSON.parse(event.data) } catch { return }
+      if (msg.type === 'state_sync') store.applyStateSync(msg.state)
+      else if (msg.type === 'participant_joined') store.addParticipant(msg.participant)
+      else if (msg.type === 'song_started') store.setSongStarted(msg.song, msg.windowEndsAt, msg.participantCount)
+      else if (msg.type === 'rating_update') store.setRatingUpdate(msg.ratedCount, msg.totalCount)
+      else if (msg.type === 'rating_reveal') store.setReveal(msg.songId, msg.ratings, msg.averageScore)
     }
 
     ws.onclose = () => {
+      setIsConnected(false)
       if (isUnmounted.current) return
       reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY)
     }
 
-    ws.onerror = () => {
-      ws.close()
-    }
+    ws.onerror = () => ws.close()
   }, [tripId, participantId, participantName])
 
   useEffect(() => {
@@ -2033,20 +2017,20 @@ export function useWebSocket(tripId: string | null, participantId: string | null
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
     const msg: ClientMessage = { type: 'rate', songId, emoji, score: EMOJI_SCORES[emoji] ?? 3 }
     wsRef.current.send(JSON.stringify(msg))
-    store.setMyRating(emoji)
+    useTripStore.getState().setMyRating(emoji)
   }, [])
-
-  const isConnected = wsRef.current?.readyState === WebSocket.OPEN
 
   return { sendRating, isConnected }
 }
 ```
 
+> Note: `isConnected` is now React state (the first draft read `wsRef.current?.readyState`, which never re-rendered the reconnect toast). `store` is read via `getState()` inside the handler to avoid re-subscribing the effect on every store change.
+
 - [ ] **Step 2: Commit**
 
 ```bash
 git add frontend/src/hooks/useWebSocket.ts
-git commit -m "feat: WebSocket hook with auto-reconnect and message dispatch" && git push && gh issue close 9
+git commit -m "feat: WebSocket hook with reactive connection state and auto-reconnect" && git push && gh issue close 9
 ```
 
 ---
@@ -2063,9 +2047,12 @@ ls frontend/src/hooks/useWebSocket.ts frontend/src/hooks/useTripStore.ts fronten
 **Files:**
 - Create: `frontend/src/main.tsx`
 - Create: `frontend/src/App.tsx`
+- Create: `frontend/src/index.css`
 - Create: `frontend/src/pages/Home.tsx`
 - Create: `frontend/src/components/CreateTripForm.tsx`
 - Create: `frontend/src/components/JoinTripForm.tsx`
+
+After creating a trip, the creator's browser is sent to `/api/spotify/login` (full-page redirect for OAuth). Identity is saved to `sessionStorage` first so it survives the round-trip; the Trip page restores it after Spotify redirects back.
 
 - [ ] **Step 1: Create app entry and router**
 
@@ -2102,7 +2089,7 @@ export default function App() {
 }
 ```
 
-- [ ] **Step 2: Create index.css (minimal mobile-first styles)**
+- [ ] **Step 2: Create index.css (mobile-first)**
 
 ```css
 /* frontend/src/index.css */
@@ -2119,33 +2106,17 @@ export default function App() {
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font);
-  min-height: 100dvh;
-}
+body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100dvh; }
 
 button {
-  cursor: pointer;
-  border: none;
-  border-radius: 8px;
-  padding: 12px 24px;
-  font-size: 16px;
-  font-weight: 600;
-  transition: opacity 0.15s;
+  cursor: pointer; border: none; border-radius: 8px;
+  padding: 12px 24px; font-size: 16px; font-weight: 600; transition: opacity 0.15s;
 }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 input {
-  background: var(--surface2);
-  border: 1px solid #333;
-  border-radius: 8px;
-  padding: 12px 16px;
-  color: var(--text);
-  font-size: 16px;
-  width: 100%;
-  outline: none;
+  background: var(--surface2); border: 1px solid #333; border-radius: 8px;
+  padding: 12px 16px; color: var(--text); font-size: 16px; width: 100%; outline: none;
 }
 input:focus { border-color: var(--accent); }
 
@@ -2162,23 +2133,31 @@ input:focus { border-color: var(--accent); }
 ```tsx
 // frontend/src/pages/Home.tsx
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import CreateTripForm from '../components/CreateTripForm'
 import JoinTripForm from '../components/JoinTripForm'
 import { useTripStore } from '../hooks/useTripStore'
 
 export default function Home() {
-  const [mode, setMode] = useState<'choose' | 'create' | 'join'>('choose')
+  const [params] = useSearchParams()
+  const joinCode = params.get('join') ?? undefined
+  const [mode, setMode] = useState<'choose' | 'create' | 'join'>(joinCode ? 'join' : 'choose')
   const navigate = useNavigate()
   const setIdentity = useTripStore(s => s.setIdentity)
 
-  const handleCreated = (participantId: string, participantName: string, tripCode: string) => {
+  const persistAndGo = (participantId: string, participantName: string, tripCode: string) => {
     setIdentity(participantId, participantName, tripCode)
-    navigate(`/trip/${tripCode}`)
+    sessionStorage.setItem(`trip:${tripCode}`, JSON.stringify({ participantId, participantName }))
+  }
+
+  // Creator → Spotify OAuth, then Spotify redirects to /trip/:code
+  const handleCreated = (participantId: string, participantName: string, tripCode: string, tripId: string) => {
+    persistAndGo(participantId, participantName, tripCode)
+    window.location.href = `/api/spotify/login?tripId=${tripId}`
   }
 
   const handleJoined = (participantId: string, participantName: string, tripCode: string) => {
-    setIdentity(participantId, participantName, tripCode)
+    persistAndGo(participantId, participantName, tripCode)
     navigate(`/trip/${tripCode}`)
   }
 
@@ -2194,13 +2173,8 @@ export default function Home() {
         </div>
       )}
 
-      {mode === 'create' && (
-        <CreateTripForm onCreated={handleCreated} onBack={() => setMode('choose')} />
-      )}
-
-      {mode === 'join' && (
-        <JoinTripForm onJoined={handleJoined} onBack={() => setMode('choose')} />
-      )}
+      {mode === 'create' && <CreateTripForm onCreated={handleCreated} onBack={() => setMode('choose')} />}
+      {mode === 'join' && <JoinTripForm onJoined={handleJoined} onBack={() => setMode('choose')} prefillCode={joinCode} />}
     </div>
   )
 }
@@ -2213,7 +2187,7 @@ export default function Home() {
 import { useState } from 'react'
 
 interface Props {
-  onCreated: (participantId: string, participantName: string, tripCode: string) => void
+  onCreated: (participantId: string, participantName: string, tripCode: string, tripId: string) => void
   onBack: () => void
 }
 
@@ -2241,9 +2215,9 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: yourName.trim() }),
       })
-      const joinData = await joinRes.json<{ participant: { id: string }; tripId: string }>()
+      const joinData = await joinRes.json<{ participant: { id: string } }>()
 
-      onCreated(joinData.participant.id, yourName.trim(), data.trip.short_code)
+      onCreated(joinData.participant.id, yourName.trim(), data.trip.short_code, data.trip.id)
     } catch {
       setError('Failed to create trip. Try again.')
       setLoading(false)
@@ -2257,12 +2231,15 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
         <input value={tripName} onChange={e => setTripName(e.target.value)} placeholder="e.g. Tel Aviv to Eilat" />
       </div>
       <div>
-        <div className="label">Your name</div>
+        <div className="label">Your name (you're the DJ)</div>
         <input value={yourName} onChange={e => setYourName(e.target.value)} placeholder="e.g. Boaz" />
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+        Next you'll connect your Spotify so your playback drives the ratings.
       </div>
       {error && <div style={{ color: '#f44', fontSize: 14 }}>{error}</div>}
       <button className="btn-primary" onClick={submit} disabled={loading || !tripName.trim() || !yourName.trim()}>
-        {loading ? 'Creating...' : 'Create Trip 🚗'}
+        {loading ? 'Creating...' : 'Create & Connect Spotify 🎧'}
       </button>
       <button className="btn-secondary" onClick={onBack}>Back</button>
     </div>
@@ -2275,7 +2252,6 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
 ```tsx
 // frontend/src/components/JoinTripForm.tsx
 import { useState } from 'react'
-import { useParams } from 'react-router-dom'
 
 interface Props {
   onJoined: (participantId: string, participantName: string, tripCode: string) => void
@@ -2284,7 +2260,7 @@ interface Props {
 }
 
 export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
-  const [code, setCode] = useState(prefillCode ?? '')
+  const [code, setCode] = useState((prefillCode ?? '').toUpperCase())
   const [yourName, setYourName] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -2305,7 +2281,7 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
         setLoading(false)
         return
       }
-      const data = await res.json<{ participant: { id: string }; tripId: string }>()
+      const data = await res.json<{ participant: { id: string } }>()
       onJoined(data.participant.id, yourName.trim(), code.trim().toUpperCase())
     } catch {
       setError('Failed to join trip. Check the code.')
@@ -2320,7 +2296,7 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
         <input
           value={code}
           onChange={e => setCode(e.target.value.toUpperCase())}
-          placeholder="e.g. ABC123"
+          placeholder="e.g. ABC234"
           maxLength={6}
           style={{ textTransform: 'uppercase', letterSpacing: 4, fontSize: 22 }}
         />
@@ -2343,12 +2319,12 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
 
 ```bash
 git add frontend/src/
-git commit -m "feat: Home page with create/join trip forms" && git push && gh issue close 10
+git commit -m "feat: Home page — create (→ Spotify OAuth) and join forms" && git push && gh issue close 10
 ```
 
 ---
 
-## Task 11: Trip Page — Layout, Tabs & WebSocket
+## Task 11: Trip Page — Layout, Tabs, WebSocket & DJ Connect
 
 **GitHub issue:** #11 — close with `gh issue close 11` at session end
 
@@ -2361,8 +2337,9 @@ ls frontend/src/main.tsx frontend/src/App.tsx frontend/src/pages/Home.tsx fronte
 - Create: `frontend/src/pages/Trip.tsx`
 - Create: `frontend/src/components/ReconnectToast.tsx`
 - Create: `frontend/src/components/QRCode.tsx`
+- Create: `frontend/src/components/ConnectSpotify.tsx`
 
-- [ ] **Step 1: Create Trip page with tab layout**
+- [ ] **Step 1: Create Trip page**
 
 ```tsx
 // frontend/src/pages/Trip.tsx
@@ -2374,6 +2351,8 @@ import CurrentSong from '../components/CurrentSong'
 import Leaderboard from '../components/Leaderboard'
 import Analysis from '../components/Analysis'
 import ReconnectToast from '../components/ReconnectToast'
+import QRCodeModal from '../components/QRCode'
+import ConnectSpotify from '../components/ConnectSpotify'
 
 type Tab = 'song' | 'leaderboard' | 'analysis'
 
@@ -2382,15 +2361,13 @@ export default function Trip() {
   const navigate = useNavigate()
   const [tab, setTab] = useState<Tab>('song')
   const [analysisUnlocked, setAnalysisUnlocked] = useState(false)
+  const [showQR, setShowQR] = useState(false)
+  const [creatorName, setCreatorName] = useState<string | null>(null)
 
-  const { participantId, participantName, tripId, tripName, shortCode } = useTripStore()
-  const { sendRating, isConnected } = useWebSocket(
-    tripId,
-    participantId,
-    participantName
-  )
+  const { participantId, participantName, tripId, tripName, shortCode, djConnected, currentSong } = useTripStore()
+  const { sendRating, isConnected } = useWebSocket(tripId, participantId, participantName)
 
-  // If no identity, try to restore from sessionStorage or redirect to join
+  // Restore identity from sessionStorage (e.g. after Spotify OAuth round-trip) or redirect to join
   useEffect(() => {
     if (!participantId && code) {
       const saved = sessionStorage.getItem(`trip:${code}`)
@@ -2401,65 +2378,69 @@ export default function Trip() {
         navigate(`/?join=${code}`)
       }
     }
-    if (participantId && code) {
-      sessionStorage.setItem(`trip:${code}`, JSON.stringify({ participantId, participantName }))
-    }
-  }, [participantId, code])
+  }, [participantId, code, navigate])
 
-  // Check if analysis is unlocked by pinging leaderboard
+  // We need tripId for the WS connection. Resolve it from the code if not set.
+  useEffect(() => {
+    if (!code) return
+    fetch(`/api/trips/${code}`)
+      .then(r => r.json<{ trip: { id: string; name: string; short_code: string; creator_name: string; djConnected: boolean } }>())
+      .then(({ trip }) => {
+        setCreatorName(trip.creator_name)
+        const s = useTripStore.getState()
+        if (!s.tripId) {
+          s.applyStateSync({
+            tripId: trip.id, tripName: trip.name, shortCode: trip.short_code,
+            djConnected: trip.djConnected, participants: [], currentSong: null,
+            windowEndsAt: null, ratedCount: 0, myRating: null,
+          })
+        }
+      })
+      .catch(() => {})
+  }, [code])
+
   useEffect(() => {
     if (!code) return
     fetch(`/api/trips/${code}/leaderboard`)
       .then(r => r.json<{ songs: unknown[] }>())
-      .then(data => setAnalysisUnlocked(data.songs.length >= 10))
+      .then(d => setAnalysisUnlocked(d.songs.length >= 10))
       .catch(() => {})
   }, [code])
 
-  if (!tripId) {
-    return <div className="page" style={{ paddingTop: 60 }}>Loading trip...</div>
-  }
+  if (!tripId) return <div className="page" style={{ paddingTop: 60 }}>Loading trip...</div>
+
+  const isCreator = !!creatorName && participantName === creatorName
+  const showDjPrompt = !djConnected && !currentSong
 
   return (
     <div style={{ maxWidth: 480, margin: '0 auto', minHeight: '100dvh', display: 'flex', flexDirection: 'column' }}>
       <ReconnectToast visible={!isConnected} />
 
-      {/* Header */}
       <div style={{ padding: '16px 16px 0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>🚗 {tripName}</div>
           <div style={{ fontSize: 11, color: 'var(--text-dim)', letterSpacing: 2 }}>{shortCode || code}</div>
         </div>
-        <QRTrigger code={shortCode || code || ''} />
+        <button onClick={() => setShowQR(true)} style={{ background: 'var(--surface2)', color: 'var(--text)', fontSize: 12, padding: '6px 12px' }}>Share</button>
       </div>
 
-      {/* Tab content */}
       <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
-        {tab === 'song' && <CurrentSong onRate={sendRating} />}
+        {showDjPrompt && <ConnectSpotify tripId={tripId} isCreator={isCreator} creatorName={creatorName} />}
+        {!showDjPrompt && tab === 'song' && <CurrentSong onRate={sendRating} />}
         {tab === 'leaderboard' && <Leaderboard code={code ?? ''} />}
         {tab === 'analysis' && <Analysis code={code ?? ''} />}
       </div>
 
-      {/* Bottom tabs */}
-      <div style={{
-        display: 'flex',
-        borderTop: '1px solid #222',
-        background: 'var(--surface)',
-        position: 'sticky',
-        bottom: 0,
-      }}>
+      <div style={{ display: 'flex', borderTop: '1px solid #222', background: 'var(--surface)', position: 'sticky', bottom: 0 }}>
         {(['song', 'leaderboard', 'analysis'] as Tab[]).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
             disabled={t === 'analysis' && !analysisUnlocked}
             style={{
-              flex: 1,
-              background: 'none',
-              borderRadius: 0,
-              padding: '12px 8px',
+              flex: 1, background: 'none', borderRadius: 0, padding: '12px 8px',
               color: tab === t ? 'var(--accent)' : (t === 'analysis' && !analysisUnlocked ? 'var(--text-dim)' : 'var(--text)'),
-              fontSize: 12,
-              fontWeight: tab === t ? 700 : 400,
+              fontSize: 12, fontWeight: tab === t ? 700 : 400,
               borderBottom: tab === t ? '2px solid var(--accent)' : '2px solid transparent',
             }}
           >
@@ -2469,48 +2450,26 @@ export default function Trip() {
           </button>
         ))}
       </div>
+
+      {showQR && <QRCodeModal code={shortCode || code || ''} onClose={() => setShowQR(false)} />}
     </div>
   )
 }
-
-function QRTrigger({ code }: { code: string }) {
-  const [show, setShow] = useState(false)
-  return (
-    <>
-      <button
-        onClick={() => setShow(true)}
-        style={{ background: 'var(--surface2)', color: 'var(--text)', fontSize: 12, padding: '6px 12px' }}
-      >
-        Share
-      </button>
-      {show && <QRModal code={code} onClose={() => setShow(false)} />}
-    </>
-  )
-}
-
-import QRCodeModal from '../components/QRCode'
-const QRModal = QRCodeModal
 ```
 
 - [ ] **Step 2: Create ReconnectToast**
 
 ```tsx
 // frontend/src/components/ReconnectToast.tsx
-
 interface Props { visible: boolean }
 
 export default function ReconnectToast({ visible }: Props) {
   if (!visible) return null
   return (
     <div style={{
-      position: 'fixed',
-      top: 0, left: 0, right: 0,
-      background: '#f44',
-      color: 'white',
-      textAlign: 'center',
-      padding: '8px',
-      fontSize: 13,
-      zIndex: 100,
+      position: 'fixed', top: 0, left: 0, right: 0,
+      background: '#f44', color: 'white', textAlign: 'center',
+      padding: '8px', fontSize: 13, zIndex: 100,
     }}>
       Reconnecting...
     </div>
@@ -2524,37 +2483,20 @@ export default function ReconnectToast({ visible }: Props) {
 // frontend/src/components/QRCode.tsx
 import { QRCodeSVG } from 'qrcode.react'
 
-interface Props {
-  code: string
-  onClose: () => void
-}
+interface Props { code: string; onClose: () => void }
 
 export default function QRCodeModal({ code, onClose }: Props) {
   const url = `${window.location.origin}/trip/${code}`
-
-  const copyLink = () => {
-    navigator.clipboard.writeText(url)
-  }
-
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
-      }}
-    >
-      <div
-        onClick={e => e.stopPropagation()}
-        style={{ background: 'var(--surface)', borderRadius: 16, padding: 32, textAlign: 'center', maxWidth: 320, width: '90%' }}
-      >
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: 'var(--surface)', borderRadius: 16, padding: 32, textAlign: 'center', maxWidth: 320, width: '90%' }}>
         <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 16 }}>Join the trip</div>
         <div style={{ background: 'white', padding: 16, borderRadius: 8, display: 'inline-block', marginBottom: 16 }}>
           <QRCodeSVG value={url} size={160} />
         </div>
         <div style={{ fontSize: 28, letterSpacing: 6, fontWeight: 700, marginBottom: 16 }}>{code}</div>
         <div className="gap">
-          <button className="btn-primary" onClick={copyLink}>Copy Link</button>
+          <button className="btn-primary" onClick={() => navigator.clipboard.writeText(url)}>Copy Link</button>
           <button className="btn-secondary" onClick={onClose}>Close</button>
         </div>
       </div>
@@ -2563,11 +2505,44 @@ export default function QRCodeModal({ code, onClose }: Props) {
 }
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Create ConnectSpotify**
+
+```tsx
+// frontend/src/components/ConnectSpotify.tsx
+interface Props {
+  tripId: string
+  isCreator: boolean
+  creatorName: string | null
+}
+
+export default function ConnectSpotify({ tripId, isCreator, creatorName }: Props) {
+  return (
+    <div style={{ textAlign: 'center', paddingTop: 60, color: 'var(--text-dim)' }}>
+      <div style={{ fontSize: 48, marginBottom: 16 }}>🎧</div>
+      {isCreator ? (
+        <>
+          <div style={{ fontSize: 18, marginBottom: 8, color: 'var(--text)' }}>Connect your Spotify to start</div>
+          <div style={{ fontSize: 14, marginBottom: 24 }}>Your playback will trigger ratings for everyone.</div>
+          <button className="btn-primary" style={{ maxWidth: 280, margin: '0 auto' }} onClick={() => { window.location.href = `/api/spotify/login?tripId=${tripId}` }}>
+            Connect Spotify
+          </button>
+        </>
+      ) : (
+        <>
+          <div style={{ fontSize: 18, marginBottom: 8, color: 'var(--text)' }}>Waiting for the DJ</div>
+          <div style={{ fontSize: 14 }}>{creatorName ?? 'The creator'} needs to connect Spotify before songs appear.</div>
+        </>
+      )}
+    </div>
+  )
+}
+```
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx
-git commit -m "feat: Trip page with tab layout, reconnect toast, QR share modal" && git push && gh issue close 11
+git add frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx frontend/src/components/ConnectSpotify.tsx
+git commit -m "feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt" && git push && gh issue close 11
 ```
 
 ---
@@ -2578,7 +2553,7 @@ git commit -m "feat: Trip page with tab layout, reconnect toast, QR share modal"
 
 **Prerequisites:** Task 11 complete. Verify:
 ```bash
-ls frontend/src/pages/Trip.tsx frontend/src/components/ReconnectToast.tsx frontend/src/components/QRCode.tsx
+ls frontend/src/pages/Trip.tsx frontend/src/components/ConnectSpotify.tsx
 ```
 
 **Files:**
@@ -2611,8 +2586,7 @@ export default function RatingButtons({ selected, disabled, onSelect }: Props) {
             fontSize: 36,
             background: selected === emoji ? 'var(--surface2)' : 'none',
             border: selected === emoji ? '2px solid var(--accent)' : '2px solid transparent',
-            borderRadius: 12,
-            padding: '8px 12px',
+            borderRadius: 12, padding: '8px 12px',
             transform: selected === emoji ? 'scale(1.15)' : 'scale(1)',
             transition: 'all 0.15s',
             opacity: disabled && selected !== emoji ? 0.4 : 1,
@@ -2657,20 +2631,15 @@ export default function CountdownTimer({ endsAt, onExpire }: Props) {
   return (
     <div style={{ textAlign: 'center', marginBottom: 8 }}>
       <div style={{
-        fontSize: isUrgent ? 28 : 22,
-        fontWeight: 700,
+        fontSize: isUrgent ? 28 : 22, fontWeight: 700,
         color: isUrgent ? '#f44' : 'var(--text)',
-        fontVariantNumeric: 'tabular-nums',
-        transition: 'color 0.3s',
+        fontVariantNumeric: 'tabular-nums', transition: 'color 0.3s',
       }}>
         {Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, '0')}
       </div>
-      <div style={{
-        height: 4, background: 'var(--surface2)', borderRadius: 2, marginTop: 6, overflow: 'hidden',
-      }}>
+      <div style={{ height: 4, background: 'var(--surface2)', borderRadius: 2, marginTop: 6, overflow: 'hidden' }}>
         <div style={{
-          height: '100%',
-          width: `${pct * 100}%`,
+          height: '100%', width: `${pct * 100}%`,
           background: isUrgent ? '#f44' : 'var(--accent)',
           transition: 'width 0.25s linear, background 0.3s',
         }} />
@@ -2694,7 +2663,7 @@ interface Props {
 }
 
 export default function RatingReveal({ ratings, averageScore, songTitle }: Props) {
-  const avgEmoji = EMOJI_ORDER[Math.max(0, Math.round(5 - averageScore))] ?? '😐'
+  const avgEmoji = EMOJI_ORDER[Math.max(0, Math.min(4, Math.round(5 - averageScore)))] ?? '😐'
 
   return (
     <div style={{ animation: 'fadeIn 0.4s ease', padding: '16px 0' }}>
@@ -2706,10 +2675,7 @@ export default function RatingReveal({ ratings, averageScore, songTitle }: Props
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {ratings.map(r => (
-          <div key={r.participantId} style={{
-            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            background: 'var(--surface2)', borderRadius: 10, padding: '10px 14px',
-          }}>
+          <div key={r.participantId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--surface2)', borderRadius: 10, padding: '10px 14px' }}>
             <span style={{ fontSize: 14 }}>{r.participantName}</span>
             <span style={{ fontSize: 28 }}>{r.emoji}</span>
           </div>
@@ -2737,8 +2703,7 @@ interface Props {
 }
 
 export default function CurrentSong({ onRate }: Props) {
-  const { currentSong, windowEndsAt, ratedCount, totalCount, myRating, lastReveal, participantId } = useTripStore()
-
+  const { currentSong, windowEndsAt, ratedCount, totalCount, myRating, lastReveal } = useTripStore()
   const isWindowOpen = !!windowEndsAt && Date.now() < windowEndsAt
 
   if (!currentSong && !lastReveal) {
@@ -2751,7 +2716,6 @@ export default function CurrentSong({ onRate }: Props) {
     )
   }
 
-  // Show reveal after window closes
   if (lastReveal && !isWindowOpen) {
     const song = currentSong
     return (
@@ -2762,14 +2726,8 @@ export default function CurrentSong({ onRate }: Props) {
             <div style={{ fontSize: 16, fontWeight: 600 }}>{song.title}</div>
           </div>
         )}
-        <RatingReveal
-          ratings={lastReveal.ratings}
-          averageScore={lastReveal.averageScore}
-          songTitle={song?.title ?? ''}
-        />
-        <div style={{ textAlign: 'center', marginTop: 24, color: 'var(--text-dim)', fontSize: 14 }}>
-          Waiting for next song...
-        </div>
+        <RatingReveal ratings={lastReveal.ratings} averageScore={lastReveal.averageScore} songTitle={song?.title ?? ''} />
+        <div style={{ textAlign: 'center', marginTop: 24, color: 'var(--text-dim)', fontSize: 14 }}>Waiting for next song...</div>
       </div>
     )
   }
@@ -2778,46 +2736,30 @@ export default function CurrentSong({ onRate }: Props) {
 
   return (
     <div>
-      {/* Album art */}
-      {currentSong.albumArt && (
-        <img
-          src={currentSong.albumArt}
-          alt="Album art"
-          style={{ width: '100%', borderRadius: 16, marginBottom: 16, aspectRatio: '1', objectFit: 'cover' }}
-        />
-      )}
-      {!currentSong.albumArt && (
+      {currentSong.albumArt ? (
+        <img src={currentSong.albumArt} alt="Album art" style={{ width: '100%', borderRadius: 16, marginBottom: 16, aspectRatio: '1', objectFit: 'cover' }} />
+      ) : (
         <div style={{ width: '100%', aspectRatio: '1', background: 'var(--surface)', borderRadius: 16, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 64 }}>🎵</div>
       )}
 
-      {/* Song info */}
       <div style={{ textAlign: 'center', marginBottom: 16 }}>
         <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{currentSong.title}</div>
         <div style={{ fontSize: 16, color: 'var(--text-dim)' }}>{currentSong.artist}</div>
       </div>
 
-      {/* Countdown */}
-      {isWindowOpen && windowEndsAt && (
-        <CountdownTimer endsAt={windowEndsAt} />
-      )}
+      {isWindowOpen && windowEndsAt && <CountdownTimer endsAt={windowEndsAt} />}
 
-      {/* Rated counter */}
       <div style={{ textAlign: 'center', fontSize: 13, color: 'var(--text-dim)', marginBottom: 8 }}>
         {ratedCount}/{totalCount} rated
       </div>
 
-      {/* Rating buttons */}
       <RatingButtons
         selected={myRating}
         disabled={!isWindowOpen}
-        onSelect={(emoji) => {
-          if (isWindowOpen) onRate(currentSong.id, emoji)
-        }}
+        onSelect={(emoji) => { if (isWindowOpen) onRate(currentSong.id, emoji) }}
       />
 
-      {!isWindowOpen && (
-        <div style={{ textAlign: 'center', color: 'var(--text-dim)', fontSize: 14 }}>Rating closed</div>
-      )}
+      {!isWindowOpen && <div style={{ textAlign: 'center', color: 'var(--text-dim)', fontSize: 14 }}>Rating closed</div>}
     </div>
   )
 }
@@ -2827,7 +2769,7 @@ export default function CurrentSong({ onRate }: Props) {
 
 ```bash
 git add frontend/src/components/
-git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown timer, reveal" && git push && gh issue close 12
+git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown, reveal" && git push && gh issue close 12
 ```
 
 ---
@@ -2838,7 +2780,7 @@ git commit -m "feat: CurrentSong tab — song card, emoji rating, countdown time
 
 **Prerequisites:** Task 12 complete. Verify:
 ```bash
-ls frontend/src/components/CurrentSong.tsx frontend/src/components/RatingButtons.tsx frontend/src/components/CountdownTimer.tsx
+ls frontend/src/components/CurrentSong.tsx frontend/src/components/CountdownTimer.tsx
 ```
 
 **Files:**
@@ -2864,7 +2806,6 @@ export default function Leaderboard({ code }: Props) {
         .then(r => r.json<{ songs: LeaderboardEntry[] }>())
         .then(d => { setSongs(d.songs); setLoading(false) })
         .catch(() => setLoading(false))
-
     load()
     const id = setInterval(load, 10_000)
     return () => clearInterval(id)
@@ -2886,26 +2827,17 @@ export default function Leaderboard({ code }: Props) {
       {songs.map((entry, i) => {
         const isShame = i >= songs.length - 2 && entry.averageScore < 2.5 && songs.length >= 3
         const isTop = i < 3
-        const avgEmoji = EMOJI_ORDER[Math.max(0, Math.round(5 - entry.averageScore))] ?? '😐'
+        const avgEmoji = EMOJI_ORDER[Math.max(0, Math.min(4, Math.round(5 - entry.averageScore)))] ?? '😐'
         return (
-          <div
-            key={entry.song.id}
-            style={{
-              background: isShame ? 'rgba(244,67,54,0.1)' : isTop ? 'rgba(255,107,53,0.08)' : 'var(--surface)',
-              border: isShame ? '1px solid rgba(244,67,54,0.3)' : '1px solid transparent',
-              borderRadius: 12,
-              padding: '12px 14px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 12,
-            }}
-          >
+          <div key={entry.song.id} style={{
+            background: isShame ? 'rgba(244,67,54,0.1)' : isTop ? 'rgba(255,107,53,0.08)' : 'var(--surface)',
+            border: isShame ? '1px solid rgba(244,67,54,0.3)' : '1px solid transparent',
+            borderRadius: 12, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 12,
+          }}>
             <div style={{ fontSize: 18, width: 32, textAlign: 'center' }}>
               {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`}
             </div>
-            {entry.song.albumArt && (
-              <img src={entry.song.albumArt} alt="" style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'cover' }} />
-            )}
+            {entry.song.albumArt && <img src={entry.song.albumArt} alt="" style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'cover' }} />}
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 14, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.song.title}</div>
               <div style={{ fontSize: 12, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.song.artist}</div>
@@ -2939,8 +2871,6 @@ git commit -m "feat: Leaderboard tab with hall of shame styling" && git push && 
 **Prerequisites:** Task 13 complete. Verify:
 ```bash
 ls frontend/src/components/Leaderboard.tsx
-# Also verify the GET /api/trips/:code/analysis endpoint works:
-# (requires wrangler dev --local running, a trip with 10+ rated songs)
 ```
 
 **Files:**
@@ -2975,8 +2905,7 @@ export default function Analysis({ code }: Props) {
           setLoading(false)
           return
         }
-        const d = await r.json<AnalysisData>()
-        setData(d)
+        setData(await r.json<AnalysisData>())
         setLoading(false)
       })
       .catch(() => { setError('Failed to load analysis'); setLoading(false) })
@@ -2995,7 +2924,6 @@ export default function Analysis({ code }: Props) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* Group taste */}
       <div className="card" style={{ textAlign: 'center' }}>
         <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 8 }}>GROUP TASTE</div>
         <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>{data.groupTaste.summary}</div>
@@ -3006,9 +2934,8 @@ export default function Analysis({ code }: Props) {
         </div>
       </div>
 
-      {/* Personality cards */}
       <div style={{ fontSize: 13, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: 1 }}>Personality Cards</div>
-      {data.personalities.filter(Boolean).map(p => (
+      {data.personalities.map(p => (
         <div key={p.participant.id} className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
             <div style={{ fontWeight: 700, fontSize: 16 }}>{p.participant.name}</div>
@@ -3023,13 +2950,7 @@ export default function Analysis({ code }: Props) {
 }
 
 function Tag({ label }: { label: string }) {
-  return (
-    <span style={{
-      background: 'var(--surface2)', borderRadius: 20, padding: '4px 12px', fontSize: 12,
-    }}>
-      {label}
-    </span>
-  )
+  return <span style={{ background: 'var(--surface2)', borderRadius: 20, padding: '4px 12px', fontSize: 12 }}>{label}</span>
 }
 ```
 
@@ -3042,18 +2963,199 @@ git commit -m "feat: Analysis tab — group taste summary and Claude personality
 
 ---
 
-## Task 15: Build & Local Integration Test
+## Task 15: API Integration & Frontend Behavior Tests
 
 **GitHub issue:** #15 — close with `gh issue close 15` at session end
 
-**Prerequisites:** Tasks 1–14 complete. The full stack is implemented. Verify:
+**Prerequisites:** Tasks 1–14 complete. Verify:
 ```bash
-ls frontend/src/components/Analysis.tsx frontend/src/components/Leaderboard.tsx frontend/src/pages/Trip.tsx worker/src/index.ts worker/src/TripRoom.ts
-pnpm install  # ensure deps are installed
+ls worker/src/index.ts frontend/src/components/Analysis.tsx
+pnpm install
 ```
 
+Per CLAUDE.md, API-level integration tests (via the `SELF` binding) are the **primary** backend strategy. These would have caught the persistence bugs in the first draft. We add the cross-layer HTTP tests here plus two focused frontend behavior tests. (The Spotify-poll path needs a live Spotify session and is covered by the Playwright E2E in Task 16.)
+
 **Files:**
-- No new files — verify everything wires together
+- Create: `worker/test/api.test.ts`
+- Create: `frontend/src/components/__tests__/CountdownTimer.test.tsx`
+- Create: `frontend/src/hooks/__tests__/tripStore.test.ts`
+
+- [ ] **Step 1: Write API integration tests**
+
+```typescript
+// worker/test/api.test.ts
+import { SELF } from 'cloudflare:test'
+import { it, expect, describe } from 'vitest'
+
+async function createTrip(name = 'Road Trip', creatorName = 'Boaz') {
+  const res = await SELF.fetch('http://example.com/api/trips', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, creatorName }),
+  })
+  const data = await res.json<{ trip: { id: string; short_code: string } }>()
+  return { res, trip: data.trip }
+}
+
+describe('trip lifecycle', () => {
+  it('creates a trip with a 6-char short code and no leaked token', async () => {
+    const { res, trip } = await createTrip()
+    expect(res.status).toBe(200)
+    expect(trip.short_code).toMatch(/^[A-HJ-NP-Z2-9]{6}$/)
+    expect((trip as Record<string, unknown>).spotify_refresh_token).toBeUndefined()
+  })
+
+  it('rejects trip creation without name or creatorName', async () => {
+    const res = await SELF.fetch('http://example.com/api/trips', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '', creatorName: '' }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('gets a trip by code with djConnected=false before OAuth', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}`)
+    const data = await res.json<{ trip: { djConnected: boolean; creator_name: string } }>()
+    expect(res.status).toBe(200)
+    expect(data.trip.djConnected).toBe(false)
+    expect(data.trip.creator_name).toBe('Boaz')
+  })
+
+  it('returns 404 for unknown code', async () => {
+    const res = await SELF.fetch('http://example.com/api/trips/ZZZZZZ')
+    expect(res.status).toBe(404)
+  })
+
+  it('joins idempotently — same name returns the same participant id', async () => {
+    const { trip } = await createTrip()
+    const join = async () => {
+      const r = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Dana' }),
+      })
+      return r.json<{ participant: { id: string } }>()
+    }
+    const a = await join()
+    const b = await join()
+    expect(a.participant.id).toBe(b.participant.id)
+  })
+})
+
+describe('leaderboard & analysis gating', () => {
+  it('returns an empty leaderboard for a fresh trip', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/leaderboard`)
+    const data = await res.json<{ songs: unknown[] }>()
+    expect(res.status).toBe(200)
+    expect(data.songs).toEqual([])
+  })
+
+  it('gates analysis behind 10 rated songs', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/analysis`)
+    expect(res.status).toBe(403)
+    const data = await res.json<{ error: string }>()
+    expect(data.error).toContain('0/10')
+  })
+})
+
+describe('spotify oauth', () => {
+  it('redirects /api/spotify/login to Spotify accounts', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/spotify/login?tripId=${trip.id}`, { redirect: 'manual' })
+    expect(res.status).toBe(302)
+    const loc = res.headers.get('Location') ?? ''
+    expect(loc).toContain('accounts.spotify.com/authorize')
+    expect(loc).toContain(`state=${trip.id}`)
+  })
+})
+```
+
+- [ ] **Step 2: Run backend tests**
+
+```bash
+cd worker && pnpm test
+```
+
+Expected: utils, spotify, and api suites all PASS.
+
+- [ ] **Step 3: Write frontend behavior tests**
+
+```tsx
+// frontend/src/components/__tests__/CountdownTimer.test.tsx
+import { render, screen } from '@testing-library/react'
+import { it, expect } from 'vitest'
+import CountdownTimer from '../CountdownTimer'
+
+it('shows remaining time and urgent color under 15 seconds', () => {
+  const endsAt = Date.now() + 10_000
+  render(<CountdownTimer endsAt={endsAt} />)
+  expect(screen.getByText('0:10')).toBeInTheDocument()
+})
+```
+
+```typescript
+// frontend/src/hooks/__tests__/tripStore.test.ts
+import { it, expect, beforeEach } from 'vitest'
+import { useTripStore } from '../useTripStore'
+
+beforeEach(() => {
+  useTripStore.setState({ currentSong: null, windowEndsAt: null, myRating: null, lastReveal: null, ratedCount: 0, totalCount: 0 })
+})
+
+it('song_started resets rating state and opens a window', () => {
+  const song = { id: 's1', spotifyTrackId: 't1', title: 'X', artist: 'Y', albumArt: null }
+  useTripStore.getState().setSongStarted(song, Date.now() + 1000, 3)
+  const s = useTripStore.getState()
+  expect(s.currentSong?.id).toBe('s1')
+  expect(s.myRating).toBeNull()
+  expect(s.totalCount).toBe(3)
+  expect(s.lastReveal).toBeNull()
+})
+
+it('reveal clears the window and stores results', () => {
+  useTripStore.getState().setReveal('s1', [], 4.2)
+  const s = useTripStore.getState()
+  expect(s.windowEndsAt).toBeNull()
+  expect(s.lastReveal?.averageScore).toBe(4.2)
+})
+```
+
+- [ ] **Step 4: Run frontend tests + type-check both packages**
+
+```bash
+cd frontend && pnpm test && pnpm typecheck
+cd ../worker && pnpm typecheck
+```
+
+Expected: all PASS, no type errors.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add worker/test/api.test.ts frontend/src/components/__tests__ frontend/src/hooks/__tests__
+git commit -m "test: API integration (SELF) + frontend behavior tests" && git push && gh issue close 15
+```
+
+---
+
+## Task 16: Build & Playwright E2E (Golden Path)
+
+**GitHub issue:** #16 — close with `gh issue close 16` at session end
+
+**Prerequisites:** Task 15 complete. Verify:
+```bash
+ls worker/test/api.test.ts
+pnpm install
+```
+
+This task verifies the full stack end-to-end with the Playwright MCP tools, driving a real browser against a local `wrangler dev`. Because the live Spotify poll needs a connected account, the song-push step is simulated by exercising the UI states that are reachable without live Spotify, plus (optionally) a real OAuth + playback run if Spotify creds are in `worker/.dev.vars`.
+
+**Files:**
+- No new app files — this is a QA gate. Optionally record findings in `docs/superpowers/specs/`.
 
 - [ ] **Step 1: Build the frontend**
 
@@ -3063,229 +3165,130 @@ cd frontend && pnpm build
 
 Expected: `frontend-dist/` created with `index.html` and assets.
 
-- [ ] **Step 2: Start Worker locally**
+- [ ] **Step 2: Apply schema and start the Worker**
 
 ```bash
+cd worker && npx wrangler d1 execute listening-road-trip --local --file=schema.sql
 cd worker && npx wrangler dev --local
 ```
 
-- [ ] **Step 3: Create a trip via curl**
+- [ ] **Step 3: Drive the golden path with Playwright MCP**
+
+Using `mcp__playwright__*` tools, verify:
+1. `/` → create trip form → submit → redirected toward `/api/spotify/login` (creator OAuth entry). Screenshot.
+2. In a second context, open `/?join=<code>`, join as a different name → lands on `/trip/<code>` → sees "Waiting for the DJ" (djConnected=false). Screenshot.
+3. WebSocket connects (check `mcp__playwright__browser_network_requests` for the `/ws` upgrade and a `state_sync`).
+4. Reconnect toast appears when the Worker is stopped, clears when restarted.
+5. Leaderboard tab shows the empty state; Analysis tab is locked (🔒).
+
+- [ ] **Step 4 (optional, needs real Spotify creds in `worker/.dev.vars`): live song flow**
+
+With a Spotify track playing on the connected account, confirm within ~10s a `song_started` arrives, the countdown shows, an emoji rating broadcasts `rating_update`, and at window close the reveal renders. Screenshot the reveal.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-curl -X POST http://localhost:8787/api/trips \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Test Trip","creatorName":"Boaz"}'
-```
-
-Note the `short_code` in the response (e.g., `ABC123`).
-
-- [ ] **Step 4: Join the trip**
-
-```bash
-curl -X POST http://localhost:8787/api/trips/ABC123/join \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Dana"}'
-```
-
-Note participant `id` in the response.
-
-- [ ] **Step 5: Open in browser**
-
-Visit `http://localhost:8787/trip/ABC123` — you should see the Trip page.
-
-- [ ] **Step 6: Test WebSocket connection**
-
-Open DevTools → Network → WS. Confirm a WebSocket connection to `/ws` is established and `state_sync` message is received.
-
-- [ ] **Step 7: Simulate a song (manually)**
-
-```bash
-curl -X POST http://localhost:8787/api/trips/ABC123/songs \
-  -H "Content-Type: application/json" \
-  -d '{"spotifyTrackId":"4u7EnebtmKWzUH433cf5Qv","title":"Bohemian Rhapsody","artist":"Queen","albumArt":null}'
-```
-
-Confirm the browser receives a `song_started` WebSocket message and shows the song card + rating buttons.
-
-- [ ] **Step 8: Submit a rating**
-
-Click an emoji in the browser. Confirm `rating_update` broadcasts in DevTools WS messages.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git commit -m "chore: local integration verified — trip create, join, song push, rating" && git push && gh issue close 15
+git commit --allow-empty -m "chore: E2E golden path verified via Playwright MCP" && git push && gh issue close 16
 ```
 
 ---
 
-## Task 16: Spotify Token Setup Script
-
-**GitHub issue:** #16 — close with `gh issue close 16` at session end
-
-**Prerequisites:** Task 15 complete — integration test passes locally. Verify:
-```bash
-ls scripts/get-spotify-token.mjs 2>/dev/null || echo "needs creating"
-```
-
-**Files:**
-- Create: `scripts/get-spotify-token.mjs`
-
-This script does the one-time OAuth dance to get a refresh token for the DJ's Spotify account.
-
-- [ ] **Step 1: Create token helper script**
-
-```javascript
-// scripts/get-spotify-token.mjs
-// Run: node scripts/get-spotify-token.mjs
-// Requires SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in env
-
-import http from 'http'
-import { exec } from 'child_process'
-
-const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID
-const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET
-const PORT = 8888
-const REDIRECT = `http://localhost:${PORT}/callback`
-const SCOPES = 'user-read-currently-playing user-read-playback-state'
-
-if (!CLIENT_ID || !CLIENT_SECRET) {
-  console.error('Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET env vars')
-  process.exit(1)
-}
-
-const authUrl = `https://accounts.spotify.com/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT)}&scope=${encodeURIComponent(SCOPES)}`
-
-console.log('Opening browser for Spotify auth...')
-exec(`open "${authUrl}"`)  // macOS. Use `xdg-open` on Linux.
-
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`)
-  const code = url.searchParams.get('code')
-  if (!code) { res.end('No code'); return }
-
-  const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64')
-  const tokenRes = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT }),
-  })
-  const data = await tokenRes.json()
-
-  console.log('\n✅ Got refresh token!\n')
-  console.log('Run these commands:')
-  console.log(`npx wrangler secret put SPOTIFY_CLIENT_ID   # value: ${CLIENT_ID}`)
-  console.log(`npx wrangler secret put SPOTIFY_CLIENT_SECRET`)
-  console.log(`npx wrangler secret put SPOTIFY_REFRESH_TOKEN   # value: ${data.refresh_token}`)
-  console.log(`npx wrangler secret put CLAUDE_API_KEY`)
-
-  res.end('<html><body><h2>✅ Authorized! Check your terminal.</h2></body></html>')
-  server.close()
-})
-
-server.listen(PORT, () => console.log(`Listening on http://localhost:${PORT}`))
-```
-
-- [ ] **Step 2: Commit**
-
-```bash
-git add scripts/get-spotify-token.mjs
-git commit -m "feat: one-time Spotify OAuth script to get refresh token" && git push && gh issue close 16
-```
-
----
-
-## Task 17: Deploy to Cloudflare
+## Task 17: Spotify App Setup & Deploy to Cloudflare
 
 **GitHub issue:** #17 — close with `gh issue close 17` at session end
 
-**Prerequisites:** Task 16 complete. Secrets must be set before deploy:
+**Prerequisites:** Task 16 complete. You need a Cloudflare account and a Spotify Developer app.
+
+**Files:**
+- No new files.
+
+- [ ] **Step 1: Register the Spotify app**
+
+In the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), create an app and add **both** redirect URIs:
+- `http://localhost:8787/api/spotify/callback` (local)
+- `https://listening-road-trip.<your-account>.workers.dev/api/spotify/callback` (prod)
+
+Note the Client ID and Client Secret.
+
+- [ ] **Step 2: Create the production D1 database**
+
 ```bash
-# Verify secrets exist (wrangler will error on deploy if missing)
-npx wrangler secret list  # should list SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN, CLAUDE_API_KEY
-# If any are missing, run: node scripts/get-spotify-token.mjs (needs SPOTIFY_CLIENT_ID + SECRET in env)
-# Then: npx wrangler secret put <NAME>
+cd worker && npx wrangler d1 create listening-road-trip
 ```
 
-- [ ] **Step 1: Build frontend**
+Copy the returned `database_id` into `wrangler.toml` (replacing `placeholder-local-dev`). Commit that change.
 
-```bash
-cd frontend && pnpm build
-```
-
-- [ ] **Step 2: Apply D1 schema to production**
+- [ ] **Step 3: Apply schema to production D1**
 
 ```bash
 cd worker && npx wrangler d1 execute listening-road-trip --file=schema.sql
 ```
 
-- [ ] **Step 3: Run the token script and set secrets**
+- [ ] **Step 4: Set secrets**
 
 ```bash
-SPOTIFY_CLIENT_ID=your_id SPOTIFY_CLIENT_SECRET=your_secret node scripts/get-spotify-token.mjs
+cd worker
+npx wrangler secret put SPOTIFY_CLIENT_ID
+npx wrangler secret put SPOTIFY_CLIENT_SECRET
+npx wrangler secret put CLAUDE_API_KEY
 ```
 
-Follow the terminal instructions to run `wrangler secret put` for all 4 secrets.
+> There is no `SPOTIFY_REFRESH_TOKEN` secret — refresh tokens are per-trip, obtained via the in-app OAuth flow and stored in D1.
 
-- [ ] **Step 4: Deploy**
+- [ ] **Step 5: Build & deploy**
 
 ```bash
-cd worker && npx wrangler deploy
+cd frontend && pnpm build
+cd ../worker && npx wrangler deploy
 ```
 
-Expected output includes: `https://listening-road-trip.<your-account>.workers.dev`
+Expected output includes `https://listening-road-trip.<your-account>.workers.dev`.
 
-- [ ] **Step 5: Smoke test production**
+- [ ] **Step 6: Smoke test production**
 
-```bash
-curl https://listening-road-trip.<your-account>.workers.dev/api/trips \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"name":"Real Road Trip","creatorName":"Boaz"}'
-```
-
-- [ ] **Step 6: Connect the DJ's Spotify**
-
-1. Start playing a song on Spotify
-2. Open the trip URL in the browser
-3. Watch DevTools WS — within 10 seconds, `song_started` should broadcast automatically
-4. Rate the song with all 5 emojis from different browser tabs to verify the reveal
+1. `curl -X POST https://<app>.workers.dev/api/trips -H "Content-Type: application/json" -d '{"name":"Real Road Trip","creatorName":"Boaz"}'` → returns a trip.
+2. Open the app, create a trip → complete the Spotify OAuth → land back on the trip page.
+3. Start playing a song on Spotify → within ~10s `song_started` broadcasts.
+4. Join from a second device, rate, and confirm the reveal at window close.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git commit -m "chore: production deployment verified" && git push && gh issue close 17
+git add wrangler.toml
+git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, verified" && git push && gh issue close 17
 ```
 
 ---
 
 ## Self-Review
 
-**Spec coverage check:**
+**Spec coverage:**
 - ✅ Trip creation with name + creator name
-- ✅ Join by name only, shareable URL + QR code + short code
-- ✅ Spotify polling via Durable Object alarm
-- ✅ Auto-broadcast on song change
+- ✅ Per-trip Spotify OAuth (creator is the DJ)
+- ✅ Join by name only; shareable URL + QR code + short code
+- ✅ Spotify polling via Durable Object alarm, using the trip's own token
+- ✅ Auto song persistence + broadcast on song change (DO writes D1 directly)
 - ✅ 2-minute rating window with countdown
-- ✅ 5 emoji ratings (🔥❤️😐😬💀) mapped to 1-5
-- ✅ Rating changes within window
-- ✅ X/N counter live, choices hidden until reveal
+- ✅ 5 emoji ratings (🔥❤️😐😬💀) mapped to 1-5, persisted to D1
+- ✅ Rating changes within window; X/N counter live; choices hidden until reveal
 - ✅ Big reveal at window close
-- ✅ Current Song tab (default)
-- ✅ Leaderboard tab with hall of shame styling
-- ✅ Analysis tab (unlocks at 10 songs)
-- ✅ Spotify audio features enrichment
-- ✅ Claude-generated personality cards + group taste
-- ✅ Trip never ends
-- ✅ Reconnecting toast on disconnect
-- ✅ API keys as Worker secrets
-- ✅ Cloudflare Pages + Workers + Durable Objects + D1
-- ✅ React frontend
+- ✅ Current Song / Leaderboard (hall of shame) / Analysis tabs
+- ✅ Analysis unlocks at 10 rated songs; result cached (no Claude re-billing)
+- ✅ Claude-generated personality cards + group taste (inferred, no audio features)
+- ✅ Trip never ends; reconnecting toast on disconnect
+- ✅ API keys + Spotify secrets as Worker secrets
+- ✅ Cloudflare Workers + Durable Objects + D1; React frontend
 
-**Gaps addressed:**
-- Song persist endpoint (`/api/trips/:code/songs`) needed for the DO→DB bridge — included in Task 7
-- `initTrip` and `registerSong` DO routes included in Task 7 step 2
-- `sessionStorage` for identity persistence on page refresh — included in Task 11
-- Token script for one-time Spotify OAuth — included in Task 16
+**Bugs fixed vs first draft:**
+- Songs & ratings now actually persist (DO has D1 access; bridge removed)
+- `pong` is a real message type; no `error`-type hack
+- `isConnected` is reactive state (reconnect toast now works)
+- Single-JOIN leaderboard (no N+1); cached analysis
+- No build-breaking unused `ctx`; no unnecessary CORS
+- Hardened `parseCurrentlyPlaying` (skips ads/podcasts)
+- Deferred `wrangler d1 create` to deploy; added `.gitignore`; current deps
+
+**Known limitations (acceptable for v1):**
+- DJ is creator-only; no hand-off to another participant
+- `totalCount` counts live WebSocket connections, so a backgrounded tab can drop the denominator briefly
+- A track replayed immediately after itself won't re-trigger until a different track plays in between
