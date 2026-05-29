@@ -4,6 +4,8 @@
 
 Real-time road trip music rating app. DJ's Spotify auto-broadcasts songs to the group via WebSocket. Everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
 
+**Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. GitHub issues mirror each task: https://github.com/boazadato/listening-road-trip/issues
+
 ## Tech Stack
 
 | Layer | Tech |
