@@ -101,7 +101,7 @@ export default function Trip() {
           <CurrentSong
             onRate={sendRating}
             isCreator={isCreator}
-            onSkip={() => { fetch(`/api/trips/${code}/skip`, { method: 'POST' }).catch(() => {}) }}
+            onSkip={() => fetch(`/api/trips/${code}/skip`, { method: 'POST' })}
           />
         )}
         {tab === 'leaderboard' && <Leaderboard code={code ?? ''} />}

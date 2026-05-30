@@ -7,7 +7,7 @@ import RatingReveal from './RatingReveal'
 interface Props {
   onRate: (songId: string, emoji: string) => void
   isCreator?: boolean
-  onSkip?: () => void
+  onSkip?: () => Promise<unknown> | void
 }
 
 export default function CurrentSong({ onRate, isCreator, onSkip }: Props) {
@@ -74,7 +74,14 @@ export default function CurrentSong({ onRate, isCreator, onSkip }: Props) {
 
       {isCreator && isWindowOpen && onSkip && (
         <button
-          onClick={() => { setSkipping(true); onSkip() }}
+          onClick={async () => {
+              setSkipping(true)
+              try {
+                await onSkip?.()
+              } catch {
+                setSkipping(false)  // reset on error; success resets via useEffect when next song arrives
+              }
+            }}
           disabled={skipping}
           style={{
             display: 'block',
