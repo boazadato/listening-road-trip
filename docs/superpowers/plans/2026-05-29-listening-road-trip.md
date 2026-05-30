@@ -186,7 +186,7 @@ The plan is split into one file per task under [`2026-05-29-listening-road-trip/
 - ✅ **Task 6** — [Durable Object — AI-DJ Orchestrator](2026-05-29-listening-road-trip/task-06-durable-object-ai-dj-orchestrator.md) — `feat: TripRoom DO — AI-DJ orchestration (batch/replan/playback), WS hub, direct D1 writes`
 - ✅ **Task 7** — [Worker Entry Point, API Routes & Spotify OAuth](2026-05-29-listening-road-trip/task-07-worker-entry-api-routes-spotify-oauth.md) — `feat: Worker routes — trips + seed prefs, leaderboard, cached analysis, Spotify OAuth (playback scope), WS upgrade`
 - ✅ **Task 8** — [Frontend Types & Store](2026-05-29-listening-road-trip/task-08-frontend-types-and-store.md) — `feat: frontend types and Zustand trip store (seed prefs, djActive, playbackError, lastReveal)`
-- ⬜ **Task 9** — [WebSocket Hook](2026-05-29-listening-road-trip/task-09-websocket-hook.md) — `feat: WebSocket hook with reactive connection state and auto-reconnect`
+- ✅ **Task 9** — [WebSocket Hook](2026-05-29-listening-road-trip/task-09-websocket-hook.md) — `feat: WebSocket hook with reactive connection state and auto-reconnect`
 - ⬜ **Task 10** — [Home Page — Create & Join Forms](2026-05-29-listening-road-trip/task-10-home-page-create-join-forms.md) — `feat: Home page — create form with seed flavours (→ Spotify OAuth) and join form`
 - ⬜ **Task 11** — [Trip Page — Layout, Tabs, WebSocket & DJ Connect](2026-05-29-listening-road-trip/task-11-trip-page-layout-tabs-ws-dj-connect.md) — `feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt`
 - ⬜ **Task 12** — [Current Song Tab](2026-05-29-listening-road-trip/task-12-current-song-tab.md) — `feat: CurrentSong tab — song card, emoji rating, countdown, reveal`
