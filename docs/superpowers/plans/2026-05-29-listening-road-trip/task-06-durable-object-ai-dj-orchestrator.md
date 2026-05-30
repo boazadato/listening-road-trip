@@ -652,6 +652,11 @@ Expected: utils, spotify, and the new triproom suites all PASS.
 
 > If `runInDurableObject`/`runDurableObjectAlarm` aren't found, they're named exports of `cloudflare:test` (provided by `@cloudflare/vitest-pool-workers`); no extra config beyond the existing `vitest.config.ts` is needed. These tests assert against the real test D1 (schema applied by `test/apply-schema.ts`), so a `no such table` failure points at the setup file, not the test.
 
+> **Implementation note (2026-05-30):** the test above passes under `vitest` (esbuild — no type-checking) as written, but **`tsc --noEmit` needs three small adjustments** that the verbatim listing omits. They were applied when the task shipped:
+> 1. **`worker/test/env.d.ts`** (new file) — `env` from `cloudflare:test` is typed `Cloudflare.Env` (an empty global interface), not `ProvidedEnv`, so `env.DB`/`env.TRIP_ROOM` don't type-check. Augment it: `declare global { namespace Cloudflare { interface Env extends WorkerEnv { TEST_SCHEMA_STATEMENTS: string[] } } }`. Add this file to the `git add` in Step 3.
+> 2. **`runInDurableObject` generic-erasure alias** — `TripRoom` is a legacy `implements DurableObject` class (no RPC brand), so `runInDurableObject<O extends DurableObject | Rpc.DurableObject>` can't infer `O` and falls back to the recursive `Rpc.DurableObject` constraint → `TS2589` (excessively deep). Import it as `_runInDurableObject` and alias: `const runInDurableObject = _runInDurableObject as unknown as <R>(stub: DurableObjectStub, cb: (instance: any, state: DurableObjectState) => R | Promise<R>) => Promise<R>`. Keeps `R` inference; drops the explosive `O`.
+> 3. **Unique `short_code` in `setupRoom`** — the test D1 persists across the file's tests, so the hardcoded `'ABC123'` collides on the `UNIQUE` constraint at the 2nd `setupRoom`. Derive a per-call code, e.g. `Math.random().toString(36).slice(2, 8).toUpperCase().padEnd(6, '0')`.
+
 - [ ] **Step 3: Commit**
 
 ```bash
