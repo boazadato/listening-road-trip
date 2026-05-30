@@ -1,6 +1,7 @@
 {
   "name": "listening-road-trip-worker",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
@@ -11,6 +12,7 @@
     "@cloudflare/vitest-pool-workers": "^0.16.3",
     "@cloudflare/workers-types": "^4.20250101.0",
     "typescript": "^5.6.0",
+    "vite": "^6.0.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.95.0"
   }

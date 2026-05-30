@@ -23,7 +23,7 @@ test:
 
 # Fast tests only: pure unit tests + type-check (used by pre-commit hook)
 test-fast:
-	cd worker && pnpm test --reporter=verbose test/utils.test.ts test/spotify.test.ts
+	cd worker && npx vitest run --reporter=verbose --passWithNoTests test/utils.test.ts test/spotify.test.ts
 	cd worker && npx tsc --noEmit
 	cd frontend && npx tsc --noEmit
 
