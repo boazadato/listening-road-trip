@@ -78,6 +78,7 @@ async function handleApi(url: URL, method: string, request: Request, env: Env): 
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'leaderboard' && method === 'GET') return leaderboardHandler(parts[1], env)
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'analysis' && method === 'GET') return analysisHandler(parts[1], env)
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'retry-dj' && method === 'POST') return retryDjHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'skip' && method === 'POST') return skipHandler(parts[1], env)
 
   return err('Not found', 404)
 }
@@ -87,6 +88,14 @@ async function retryDjHandler(code: string, env: Env): Promise<Response> {
   if (!trip) return err('Trip not found', 404)
   const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
   await stub.fetch('https://do/start-djing', { method: 'POST' })
+  return json({ ok: true })
+}
+
+async function skipHandler(code: string, env: Env): Promise<Response> {
+  const trip = await getTripByCode(env.DB, code.toUpperCase())
+  if (!trip) return err('Trip not found', 404)
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
+  await stub.fetch('https://do/skip', { method: 'POST' })
   return json({ ok: true })
 }
 
