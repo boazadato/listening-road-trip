@@ -79,7 +79,7 @@ export class TripRoom implements DurableObject {
       const current = await this.ctx.storage.get<SongInfo>('currentSong')
       const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
       const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
-      if (!current || !windowOpen) await this.advanceToNextSong()
+      if ((!current || !windowOpen) && !this.advancing) await this.advanceToNextSong()
       return new Response('OK')
     }
 
@@ -184,9 +184,11 @@ export class TripRoom implements DurableObject {
 
     // Auto-skip: once a majority of connected participants have rated and the
     // running average is below neutral, cut the song short.
-    const total = this.ctx.getWebSockets().length
+    const connected = this.ctx.getWebSockets().length
     const rated = Object.values(ratings)
+    const total = Math.max(connected, rated.length)  // include disconnected raters in the denominator
     const avg = rated.reduce((s, r) => s + r.score, 0) / rated.length
+    // Note: MIN_FLOOR_MS floors the window length but doesn't block early auto-skip — intentional.
     if (rated.length > total / 2 && avg < AUTO_SKIP_THRESHOLD) {
       await this.advanceNow()
     }
