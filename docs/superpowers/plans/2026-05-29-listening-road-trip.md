@@ -1,12 +1,12 @@
 # Listening Road Trip Implementation Plan
 
-**Goal:** Build a real-time road trip music rating web app where the trip creator's Spotify playback auto-broadcasts to the group, everyone rates with emojis, and a leaderboard + AI taste analysis accumulate over the trip.
+**Goal:** Build a real-time road trip music rating web app with an **AI DJ**: Claude selects the songs from the creator's seed flavours and re-plans from the group's ratings, playing each pick on the creator's real Spotify device. Everyone rates with emojis, and a leaderboard + AI taste analysis accumulate over the trip.
 
-**Architecture:** A single Cloudflare Worker serves the built React frontend as static assets plus all API routes. Each trip has a Durable Object that (a) holds WebSocket connections for all participants and (b) polls Spotify every 5 seconds via an alarm, broadcasting new songs and closing rating windows automatically. **The Durable Object has direct access to D1** (same `env` as the Worker) and persists songs and ratings itself — there is no Worker round-trip bridge. D1 (SQLite) persists trips, participants, songs, ratings, and a cached analysis payload.
+**Architecture:** A single Cloudflare Worker serves the built React frontend as static assets plus all API routes. Each trip has a Durable Object that (a) holds WebSocket connections for all participants and (b) **orchestrates the AI DJ** via a 5-second alarm: it maintains a queue of upcoming tracks, plays the next one on the creator's Spotify device, opens/closes rating windows, and re-plans the next batch from accumulated ratings. **The Durable Object has direct access to D1** (same `env` as the Worker) and persists songs and ratings itself — there is no Worker round-trip bridge. D1 (SQLite) persists trips (incl. seed prefs), participants, songs, ratings, and a cached analysis payload.
 
-**Spotify model:** Per-trip OAuth. One Spotify app is registered (global `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`). The trip **creator** connects their own Spotify via an in-app OAuth flow; the resulting refresh token is stored on the trip row. The trip's Durable Object reads that token from D1 to poll. Non-creators just rate.
+**Spotify model:** Per-trip OAuth, used to **control playback**, not just observe it. One Spotify app is registered (global `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`). The trip **creator** connects their own Spotify via an in-app OAuth flow (scopes `user-read-playback-state user-modify-playback-state user-read-currently-playing`); the resulting refresh token is stored on the trip row. The trip's Durable Object reads that token from D1 to resolve Claude's picks via track search and `play` them on the creator's active device. The creator needs **Spotify Premium + an active device**. Non-creators just rate.
 
-**Tech Stack:** React + Vite (frontend), Cloudflare Workers + Durable Objects + D1 (backend), Spotify Web API (currently-playing only — audio-features is deprecated and not used), Claude API (personality + group-taste generation, inferred from titles/artists/scores), pnpm workspaces, TypeScript, Vitest.
+**Tech Stack:** React + Vite (frontend), Cloudflare Workers + Durable Objects + D1 (backend), Spotify Web API (track search + playback control + currently-playing sync — audio-features is deprecated and not used), Claude API (song-batch selection seeded by DJ flavours + personality + group-taste generation, inferred from titles/artists/scores), pnpm workspaces, TypeScript, Vitest.
 
 ---
 
@@ -41,6 +41,18 @@ Scoped revision for a **friends-only, handful-of-trips** deployment (the Spotify
 1. **Rating window now tracks real playback** (Tasks 4, 6, 12) — reverses Resolved Design Decision #1. The old fixed 2-minute wall-clock window left `pollSpotify()` doing `if (windowOpen) return`, so the DJ's music kept advancing while a window stayed open: people rated a song that was no longer playing and every intermediate song was silently dropped. The window now (a) is sized to the song's **remaining play time** (`duration_ms − progress_ms`, newly parsed from Spotify), clamped to `[20s, 5min]`, so the countdown genuinely tracks the song ending; and (b) **closes early when the DJ skips to a different track** (the alarm now polls every 5s *even while a window is open*), then opens the next song's window. A 20s min-floor doubles as anti-flicker for rapid skips. Ratings now always match what is actually playing, and no songs are dropped.
 
 2. **Dependency/compat freshness** (Task 1) — bumped `compatibility_date` `2025-01-01` → `2026-05-01`, and the **test toolchain** to current: `@cloudflare/vitest-pool-workers ^0.16.3` + `vitest ^4.1.0` (both packages). These were the only hard-locked-stale pins — a caret on `0.6.0` cannot reach the current `0.16.x`, and `0.16.x` requires vitest 4. All other carets (`wrangler ^4`, `@cloudflare/workers-types ^4.x`) already resolve to current. The frontend framework majors (vite 5, react-router-dom 6, zustand 4, react 18) are left as-is deliberately — they install cleanly and the inline code targets them; jumping majors is unjustified migration risk at this scale.
+
+### Revision Note 4 (2026-05-30, AI-DJ pivot)
+
+The game changed from **"the DJ's real Spotify playback is the song source"** to **"Claude is the DJ."** The creator no longer presses play on songs of their choosing; instead they seed the playlist with taste preferences and Claude selects the songs, playing them on the creator's Spotify device and re-planning as ratings come in. Three decisions, locked with the product owner:
+
+1. **AI controls real Spotify playback.** Claude picks a track (title + artist); the DO resolves it via Spotify track **search** to a real `uri` and `play`s it on the creator's **active device** (`PUT /v1/me/player/play`). Requires Premium + an open Spotify client and the `user-modify-playback-state` scope. If no device is reachable the `play` call 404s and the DO broadcasts a `playback_error` for the creator to fix and retry.
+2. **Structured seed flavours.** At trip creation the creator picks genres + decades (chips) and an energy level (1–5), stored as JSON on the trip row (`seed_prefs`). This seeds the first Claude batch.
+3. **Batch-then-replan adaptivity.** Claude returns ~5 songs per call (`generateSongBatch`). The DO plays through the batch; when the queue runs low it re-plans the next ~5 from a rating summary (which songs/genres scored high vs. low) plus an exclusion list of already-played tracks. A prefetch at `queue.length <= 1` keeps playback gapless.
+
+**What this changes vs. Revision Note 3:** the alarm loop no longer treats `currently-playing` as the source of truth (that poll is now sync-only, for pause/manual-skip detection). The window is sized to the song's **full duration** (we start playback at position 0), not `duration_ms − progress_ms`. New code: `spotify.searchTrack` + `spotify.startPlayback`, `claude.generateSongBatch`, `db.getRatingSummary`, `seed_prefs`/`spotify_uri`/`play_order`/`reason` columns, a `playback_error` WS message, and seed-flavour UI on the create form. The DO route `/start-polling` is renamed `/start-djing`.
+
+**Accepted risks (documented):** no active device → `playback_error` + retry (we can't auto-start audio remotely); Claude may name a track that doesn't resolve → we drop it and re-plan sooner; batch-boundary latency → mitigated by prefetch; the ≤5-DJ Premium dev-mode cap is unchanged (we keep per-trip user OAuth) and remains the public-launch blocker.
 
 ---
 
@@ -92,10 +104,10 @@ Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 │   ├── .dev.vars                        # local secrets (gitignored)
 │   └── src/
 │       ├── index.ts                     # Worker entry: routing, Spotify OAuth, WS upgrade
-│       ├── TripRoom.ts                  # Durable Object: WS hub + Spotify polling + D1 writes
+│       ├── TripRoom.ts                  # Durable Object: WS hub + AI-DJ orchestration (batch/replan/playback) + D1 writes
 │       ├── db.ts                        # D1 typed query helpers
-│       ├── spotify.ts                   # Token refresh + OAuth exchange + currently-playing
-│       ├── claude.ts                    # Personality + group taste generation
+│       ├── spotify.ts                   # Token refresh + OAuth exchange + currently-playing + track search + playback control
+│       ├── claude.ts                    # Song-batch selection + personality + group taste generation
 │       ├── types.ts                     # Shared types (WS messages, DB rows, API payloads)
 │       └── utils.ts                     # Short code / id generation, response helpers
 │   └── test/
@@ -495,11 +507,18 @@ ls package.json wrangler.toml worker/package.json frontend/package.json
 ```typescript
 // worker/src/types.ts
 
+export interface SeedPrefs {
+  genres: string[]
+  decades: string[]
+  energy: number   // 1–5
+}
+
 export interface Trip {
   id: string
   name: string
   short_code: string
   creator_name: string
+  seed_prefs: string | null   // JSON-encoded SeedPrefs
   spotify_refresh_token: string | null
   created_at: number
 }
@@ -515,9 +534,12 @@ export interface Song {
   id: string
   trip_id: string
   spotify_track_id: string
+  spotify_uri: string | null
   title: string
   artist: string
   album_art: string | null
+  reason: string | null    // Claude's one-line rationale for the pick
+  play_order: number       // 0-based order the AI DJ played it
   identified_at: number
 }
 
@@ -532,11 +554,13 @@ export interface Rating {
 
 export interface SpotifyTrack {
   id: string
+  uri: string           // spotify:track:... — passed to the playback `play` call
   title: string
   artist: string
   album_art: string | null
   duration_ms: number
-  progress_ms: number   // playback position when polled — used to size the rating window to remaining song time
+  progress_ms: number   // playback position when polled — used only by the sync poll
+  reason?: string        // Claude's rationale, carried from the pick through resolution
 }
 
 // WebSocket message types — server → client
@@ -546,6 +570,7 @@ export type ServerMessage =
   | { type: 'song_started'; song: SongInfo; windowEndsAt: number; participantCount: number }
   | { type: 'rating_update'; ratedCount: number; totalCount: number }
   | { type: 'rating_reveal'; songId: string; ratings: RatingInfo[]; averageScore: number }
+  | { type: 'playback_error'; reason: string }   // e.g. no active Spotify device — creator must open Spotify and retry
   | { type: 'pong' }
 
 // WebSocket message types — client → server
@@ -559,6 +584,7 @@ export interface SongInfo {
   title: string
   artist: string
   albumArt: string | null
+  reason: string | null   // why the AI DJ picked it (shown under the title + on the reveal)
 }
 
 export interface RatingInfo {
@@ -573,6 +599,7 @@ export interface TripState {
   tripName: string
   shortCode: string
   djConnected: boolean
+  djActive: boolean   // creator's Spotify device reachable (false after a playback_error until retry)
   participants: Pick<Participant, 'id' | 'name'>[]
   currentSong: SongInfo | null
   windowEndsAt: number | null
@@ -602,6 +629,7 @@ CREATE TABLE IF NOT EXISTS trips (
   name TEXT NOT NULL,
   short_code TEXT NOT NULL UNIQUE,
   creator_name TEXT NOT NULL,
+  seed_prefs TEXT,                 -- JSON: { genres: string[], decades: string[], energy: number }
   spotify_refresh_token TEXT,
   created_at INTEGER NOT NULL
 );
@@ -618,9 +646,12 @@ CREATE TABLE IF NOT EXISTS songs (
   id TEXT PRIMARY KEY,
   trip_id TEXT NOT NULL REFERENCES trips(id),
   spotify_track_id TEXT NOT NULL,
+  spotify_uri TEXT,                -- spotify:track:... played on the DJ device
   title TEXT NOT NULL,
   artist TEXT NOT NULL,
   album_art TEXT,
+  reason TEXT,                     -- Claude's one-line rationale for the pick
+  play_order INTEGER NOT NULL DEFAULT 0,
   identified_at INTEGER NOT NULL
 );
 
@@ -661,7 +692,7 @@ Expected: "Successfully executed N commands"
 
 ```bash
 git add worker/src/types.ts worker/schema.sql
-git commit -m "feat: types and D1 schema (per-trip token, analysis cache, no audio features)" && git push
+git commit -m "feat: types and D1 schema (seed prefs, AI-DJ song fields, per-trip token, analysis cache)" && git push
 ```
 
 ---
@@ -770,8 +801,8 @@ export async function createTrip(
 ): Promise<Trip> {
   const row = { ...trip, created_at: trip.created_at ?? Date.now() }
   await db
-    .prepare('INSERT INTO trips (id, name, short_code, creator_name, spotify_refresh_token, created_at) VALUES (?,?,?,?,?,?)')
-    .bind(row.id, row.name, row.short_code, row.creator_name, row.spotify_refresh_token ?? null, row.created_at)
+    .prepare('INSERT INTO trips (id, name, short_code, creator_name, seed_prefs, spotify_refresh_token, created_at) VALUES (?,?,?,?,?,?,?)')
+    .bind(row.id, row.name, row.short_code, row.creator_name, row.seed_prefs ?? null, row.spotify_refresh_token ?? null, row.created_at)
     .run()
   return row as Trip
 }
@@ -815,10 +846,30 @@ export async function getParticipants(db: D1Database, tripId: string): Promise<P
 export async function createSong(db: D1Database, song: Omit<Song, 'identified_at'>): Promise<Song> {
   const row = { ...song, identified_at: Date.now() }
   await db
-    .prepare('INSERT INTO songs (id, trip_id, spotify_track_id, title, artist, album_art, identified_at) VALUES (?,?,?,?,?,?,?)')
-    .bind(row.id, row.trip_id, row.spotify_track_id, row.title, row.artist, row.album_art ?? null, row.identified_at)
+    .prepare('INSERT INTO songs (id, trip_id, spotify_track_id, spotify_uri, title, artist, album_art, reason, play_order, identified_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .bind(row.id, row.trip_id, row.spotify_track_id, row.spotify_uri ?? null, row.title, row.artist, row.album_art ?? null, row.reason ?? null, row.play_order, row.identified_at)
     .run()
   return row as Song
+}
+
+// Rated songs with their average score — the adaptation input for the AI DJ's
+// re-plan (and reusable elsewhere). One GROUP BY, no N+1.
+export async function getRatingSummary(
+  db: D1Database,
+  tripId: string
+): Promise<{ title: string; artist: string; averageScore: number }[]> {
+  const result = await db
+    .prepare(`
+      SELECT s.title, s.artist, AVG(r.score) AS averageScore
+      FROM songs s
+      JOIN ratings r ON r.song_id = s.id
+      WHERE s.trip_id = ?
+      GROUP BY s.id
+      ORDER BY s.play_order ASC
+    `)
+    .bind(tripId)
+    .all<{ title: string; artist: string; averageScore: number }>()
+  return result.results
 }
 
 export async function upsertRating(db: D1Database, rating: Omit<Rating, 'submitted_at'>): Promise<void> {
@@ -842,9 +893,12 @@ interface LeaderboardRow {
   id: string
   trip_id: string
   spotify_track_id: string
+  spotify_uri: string | null
   title: string
   artist: string
   album_art: string | null
+  reason: string | null
+  play_order: number
   identified_at: number
   participant_id: string | null
   emoji: string | null
@@ -856,7 +910,7 @@ interface LeaderboardRow {
 export async function getLeaderboard(db: D1Database, tripId: string): Promise<LeaderboardSong[]> {
   const result = await db
     .prepare(`
-      SELECT s.id, s.trip_id, s.spotify_track_id, s.title, s.artist, s.album_art, s.identified_at,
+      SELECT s.id, s.trip_id, s.spotify_track_id, s.spotify_uri, s.title, s.artist, s.album_art, s.reason, s.play_order, s.identified_at,
              r.participant_id, r.emoji, r.score, p.name AS participant_name
       FROM songs s
       LEFT JOIN ratings r ON r.song_id = s.id
@@ -876,9 +930,12 @@ export async function getLeaderboard(db: D1Database, tripId: string): Promise<Le
           id: row.id,
           trip_id: row.trip_id,
           spotify_track_id: row.spotify_track_id,
+          spotify_uri: row.spotify_uri,
           title: row.title,
           artist: row.artist,
           album_art: row.album_art,
+          reason: row.reason,
+          play_order: row.play_order,
           identified_at: row.identified_at,
         },
         ratings: [],
@@ -937,7 +994,7 @@ export async function setAnalysisCache(
 
 ```bash
 git add worker/src/utils.ts worker/src/db.ts worker/test/
-git commit -m "feat: utils and D1 helpers — per-trip token, single-JOIN leaderboard, analysis cache" && git push
+git commit -m "feat: utils and D1 helpers — seed prefs, rating summary, single-JOIN leaderboard, analysis cache" && git push
 ```
 
 ---
@@ -962,16 +1019,18 @@ ls worker/src/utils.ts worker/src/db.ts worker/test/utils.test.ts
 > | Podcast episode | 200 | `true` | `episode` | **`null`** | `null` (gated on `!item`) |
 > | Nothing playing | 204 | — | — | — | `null` (gated on 204 in `fetchCurrentlyPlaying`) |
 >
-> Key findings: **podcasts/ads return `item: null`** (not a populated non-track item) because we don't request `additional_types=episode` — the `!r.item` guard is what actually skips them. **Paused returns the full item with `is_playing:false`** — gating on `is_playing` is required, and is safe because the DO keeps its stored `currentSong` so resuming doesn't re-broadcast (see `pollSpotify` Task 6). **The refresh token did NOT rotate** across repeated refreshes (no rotation warning) — the "store the refresh token once on the trip row" assumption holds. Ads were not directly observed (Premium account shows none) but share the podcast shape and the same guard. Delete `scripts/spotify-spike.mjs` once Task 4 is implemented and green.
+> Key findings: **podcasts/ads return `item: null`** (not a populated non-track item) because we don't request `additional_types=episode` — the `!r.item` guard is what actually skips them. **Paused returns the full item with `is_playing:false`** — gating on `is_playing` is required, and is safe because the DO keeps its stored `currentSong` so resuming doesn't re-broadcast (see `reconcilePlayback` Task 6). **The refresh token did NOT rotate** across repeated refreshes (no rotation warning) — the "store the refresh token once on the trip row" assumption holds. Ads were not directly observed (Premium account shows none) but share the podcast shape and the same guard. Delete `scripts/spotify-spike.mjs` once Task 4 is implemented and green.
 
-Note: `audio-features` is **not** implemented — Spotify deprecated it for apps created after 2024-11-27. Taste analysis infers genre/vibe from titles/artists/scores (Task 5).
+This module now also **controls playback**, not just reads it: `searchTrack` resolves a Claude pick (title + artist) to a real track, and `startPlayback` plays it on the creator's active device. `parseCurrentlyPlaying` stays, but the alarm uses it only to sync (detect pause / manual skip), not as the song source.
+
+Note: `audio-features` is **not** implemented — Spotify deprecated it for apps created after 2024-11-27. Taste analysis (and song selection) infers genre/vibe from titles/artists/scores (Task 5).
 
 - [ ] **Step 1: Write Spotify tests**
 
 ```typescript
 // worker/test/spotify.test.ts
 import { describe, it, expect, vi } from 'vitest'
-import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying } from '../src/spotify'
+import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying, searchTrack, startPlayback } from '../src/spotify'
 
 describe('refreshAccessToken', () => {
   it('returns access token from Spotify response', async () => {
@@ -1037,6 +1096,7 @@ describe('parseCurrentlyPlaying', () => {
       item: {
         type: 'track',
         id: 'track_123',
+        uri: 'spotify:track:track_123',
         name: 'Bohemian Rhapsody',
         artists: [{ name: 'Queen' }],
         album: { images: [{ url: 'https://img.spotify.com/art.jpg' }] },
@@ -1045,6 +1105,7 @@ describe('parseCurrentlyPlaying', () => {
     }
     expect(parseCurrentlyPlaying(response)).toEqual({
       id: 'track_123',
+      uri: 'spotify:track:track_123',
       title: 'Bohemian Rhapsody',
       artist: 'Queen',
       album_art: 'https://img.spotify.com/art.jpg',
@@ -1059,6 +1120,49 @@ describe('parseCurrentlyPlaying', () => {
       item: { type: 'track', id: 't1', name: 'X', artists: [], album: {}, duration_ms: 1000 },
     }
     expect(parseCurrentlyPlaying(response)?.progress_ms).toBe(0)
+  })
+})
+
+describe('searchTrack', () => {
+  it('resolves the first match to a playable track', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        tracks: { items: [{
+          id: 'tk1', uri: 'spotify:track:tk1', name: 'Song', duration_ms: 200000,
+          artists: [{ name: 'Artist' }], album: { images: [{ url: 'art.jpg' }] },
+        }] },
+      }), { headers: { 'Content-Type': 'application/json' } })
+    )
+    const track = await searchTrack('tok', 'Song', 'Artist', mockFetch)
+    expect(track).toEqual({ id: 'tk1', uri: 'spotify:track:tk1', title: 'Song', artist: 'Artist', album_art: 'art.jpg', duration_ms: 200000, progress_ms: 0 })
+    // q combines track + artist; type=track; limit=1
+    const calledUrl = String(mockFetch.mock.calls[0][0])
+    expect(calledUrl).toContain('/v1/search')
+    expect(calledUrl).toContain('type=track')
+    expect(calledUrl).toContain('limit=1')
+  })
+
+  it('returns null when there are no results (caller skips the pick)', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ tracks: { items: [] } }), { headers: { 'Content-Type': 'application/json' } })
+    )
+    expect(await searchTrack('tok', 'Nope', 'Nobody', mockFetch)).toBeNull()
+  })
+})
+
+describe('startPlayback', () => {
+  it('PUTs the track uri to the play endpoint', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    await startPlayback('tok', 'spotify:track:tk1', undefined, mockFetch)
+    const [url, init] = mockFetch.mock.calls[0]
+    expect(String(url)).toContain('/v1/me/player/play')
+    expect(init.method).toBe('PUT')
+    expect(JSON.parse(init.body)).toEqual({ uris: ['spotify:track:tk1'] })
+  })
+
+  it('throws NoActiveDeviceError on 404', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 404 }))
+    await expect(startPlayback('tok', 'spotify:track:tk1', undefined, mockFetch)).rejects.toThrow(/no active device/i)
   })
 })
 ```
@@ -1132,6 +1236,7 @@ export function parseCurrentlyPlaying(response: unknown): SpotifyTrack | null {
   if (!item.id || !item.name) return null
   return {
     id: item.id as string,
+    uri: (item.uri as string) ?? '',
     title: item.name as string,
     artist: artists.map(a => a.name).join(', '),
     album_art: images[0]?.url ?? null,
@@ -1148,6 +1253,61 @@ export async function fetchCurrentlyPlaying(accessToken: string): Promise<Spotif
   if (!res.ok) throw new Error(`Spotify currently-playing failed: ${res.status}`)
   return parseCurrentlyPlaying(await res.json())
 }
+
+// Resolve a Claude pick (title + artist) to a real, playable track. Returns null
+// when Spotify has no match — the caller drops the pick and lets the next one play.
+export async function searchTrack(
+  accessToken: string,
+  title: string,
+  artist: string,
+  fetchFn: FetchFn = fetch
+): Promise<SpotifyTrack | null> {
+  const q = `track:${title} artist:${artist}`
+  const url = `https://api.spotify.com/v1/search?type=track&limit=1&q=${encodeURIComponent(q)}`
+  const res = await fetchFn(url, { headers: { Authorization: `Bearer ${accessToken}` } })
+  if (!res.ok) throw new Error(`Spotify search failed: ${res.status}`)
+  const data = await res.json<{ tracks?: { items?: Array<Record<string, unknown>> } }>()
+  const item = data.tracks?.items?.[0]
+  if (!item) return null
+  const artists = (item.artists as Array<{ name: string }> | undefined) ?? []
+  const album = (item.album as Record<string, unknown> | undefined) ?? {}
+  const images = (album.images as Array<{ url: string }> | undefined) ?? []
+  return {
+    id: item.id as string,
+    uri: item.uri as string,
+    title: item.name as string,
+    artist: artists.map(a => a.name).join(', '),
+    album_art: images[0]?.url ?? null,
+    duration_ms: (item.duration_ms as number) ?? 0,
+    progress_ms: 0,
+  }
+}
+
+// Thrown when Spotify reports no active device (HTTP 404 from the play endpoint).
+// The DO catches this and broadcasts a `playback_error` so the creator can open
+// Spotify and retry.
+export class NoActiveDeviceError extends Error {
+  constructor() { super('no active device') }
+}
+
+// Start playback of a single track on the creator's device. `deviceId` is optional —
+// omitted, Spotify uses the user's currently active device.
+export async function startPlayback(
+  accessToken: string,
+  uri: string,
+  deviceId: string | undefined = undefined,
+  fetchFn: FetchFn = fetch
+): Promise<void> {
+  const url = new URL('https://api.spotify.com/v1/me/player/play')
+  if (deviceId) url.searchParams.set('device_id', deviceId)
+  const res = await fetchFn(url.toString(), {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uris: [uri] }),
+  })
+  if (res.status === 404) throw new NoActiveDeviceError()
+  if (!res.ok && res.status !== 204) throw new Error(`Spotify play failed: ${res.status}`)
+}
 ```
 
 - [ ] **Step 4: Run test — expect pass**
@@ -1162,12 +1322,12 @@ Expected: PASS
 
 ```bash
 git add worker/src/spotify.ts worker/test/spotify.test.ts
-git commit -m "feat: Spotify client — token refresh, OAuth code exchange, hardened currently-playing" && git push
+git commit -m "feat: Spotify client — token refresh, OAuth exchange, currently-playing, track search + playback control" && git push
 ```
 
 ---
 
-## Task 5: Claude Taste Generator
+## Task 5: Claude — Song Selection + Taste Generator
 
 **Prerequisites:** Task 4 complete. Verify:
 ```bash
@@ -1177,12 +1337,13 @@ ls worker/src/spotify.ts worker/test/spotify.test.ts
 **Files:**
 - Create: `worker/src/claude.ts`
 
-Genre/vibe is inferred by Claude from song titles, artists, and scores — there is no audio-features input.
+This module is now also the **AI DJ's brain**: `generateSongBatch` picks the next ~5 songs from the seed flavours and the rating history (the batch-then-replan loop). Genre/vibe is inferred by Claude from song titles, artists, and scores — there is no audio-features input. All three functions share the existing `callClaude` + `parseJson` helpers.
 
 - [ ] **Step 1: Implement Claude client**
 
 ```typescript
 // worker/src/claude.ts
+import type { SeedPrefs } from './types'
 
 export interface PersonalityResult {
   label: string    // e.g. "The Reluctant Optimist"
@@ -1267,18 +1428,66 @@ Respond in JSON: { "summary": "...", "topGenre": "...", "vibe": "..." }`
 
   return parseJson<GroupTasteResult>(await callClaude(prompt, apiKey, 150))
 }
+
+export interface SongPick {
+  title: string
+  artist: string
+  reason: string   // one short line: why this fits the group right now
+}
+
+export interface RatedSongSummary {
+  title: string
+  artist: string
+  averageScore: number
+}
+
+// The AI DJ. Picks the next batch from the seed flavours, leaning into what the
+// group has rated highly and away from what flopped. `history` is empty for the
+// first batch (pure seed). `alreadyPlayed` is the exclusion list so we never repeat.
+export async function generateSongBatch(
+  seed: SeedPrefs,
+  history: RatedSongSummary[],
+  alreadyPlayed: { title: string; artist: string }[],
+  apiKey: string,
+  count = 5
+): Promise<SongPick[]> {
+  const liked = [...history].sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
+  const disliked = [...history].sort((a, b) => a.averageScore - b.averageScore).slice(0, 5)
+
+  const prompt = `You are the AI DJ for a road trip music rating game. Pick the next ${count} songs to play.
+
+Seed taste (set by the trip's DJ):
+- Genres: ${seed.genres.join(', ') || 'any'}
+- Decades: ${seed.decades.join(', ') || 'any'}
+- Energy (1 chill … 5 high): ${seed.energy}
+
+${history.length === 0 ? 'This is the first batch — go off the seed taste.' : `Ratings so far (🔥=5 … 💀=1), use these to adapt:
+Crowd favorites: ${liked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'}
+Flops to avoid leaning on: ${disliked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'}
+Lean toward the favorites' style; steer away from the flops while staying within the seed taste.`}
+
+Do NOT repeat any of these already-played songs:
+${alreadyPlayed.map(s => `- "${s.title}" by ${s.artist}`).join('\n') || '- (none yet)'}
+
+Return real, well-known, findable songs (exact title + primary artist as they appear on Spotify). For each, add a short one-line reason.
+
+Respond in JSON: { "songs": [ { "title": "...", "artist": "...", "reason": "..." } ] }`
+
+  const result = parseJson<{ songs: SongPick[] }>(await callClaude(prompt, apiKey, 700))
+  return Array.isArray(result.songs) ? result.songs : []
+}
 ```
 
 - [ ] **Step 2: Commit**
 
 ```bash
 git add worker/src/claude.ts
-git commit -m "feat: Claude client — personality + group taste inferred from titles/artists/scores" && git push
+git commit -m "feat: Claude client — AI-DJ song batch selection + personality + group taste" && git push
 ```
 
 ---
 
-## Task 6: Durable Object — WebSocket Hub + Direct D1 Writes
+## Task 6: Durable Object — AI-DJ Orchestrator (WebSocket Hub + Playback + Direct D1 Writes)
 
 **Prerequisites:** Task 5 complete. Verify:
 ```bash
@@ -1288,26 +1497,30 @@ ls worker/src/claude.ts worker/src/spotify.ts worker/src/db.ts worker/src/utils.
 **Files:**
 - Create: `worker/src/TripRoom.ts`
 
-The Durable Object is the heart of the app. It:
+The Durable Object is the heart of the app — now the **AI DJ orchestrator**. It:
 1. Holds WebSocket connections for all participants
-2. Runs Spotify polling via alarms every 5 seconds, using the **trip's own** refresh token read from D1 — and now polls **even while a rating window is open**, so it can close the window the moment the DJ skips
-3. Manages rating windows (opens on new song, window sized to the song's remaining play time, closes early when the DJ changes tracks, broadcasts reveal)
-4. **Writes songs and ratings directly to D1** via `this.env.DB` — no Worker bridge
-5. Persists its live state (current song, window end time, ratings received) in DO storage
+2. Maintains a `queue` of resolved upcoming tracks; when it runs low it calls Claude (`generateSongBatch`) with the seed prefs + rating summary and resolves each pick via `searchTrack` (the batch-then-replan loop)
+3. `advanceToNextSong()` plays the next queued track on the creator's device (`startPlayback`), opens a rating window sized to the song's duration, and broadcasts `song_started`; on a 404 (no device) it broadcasts `playback_error`
+4. Runs a 5-second alarm that reveals ratings when the window elapses, then advances; **prefetches** the next batch when the queue hits 1; and keeps a light `currently-playing` poll only to detect pause / manual skip
+5. **Writes songs and ratings directly to D1** via `this.env.DB` — no Worker bridge
+6. Persists its live state (queue, current song, window end time, ratings, play order) in DO storage; the alarm still **stops when no sockets are connected** and resumes on reconnect
 
 - [ ] **Step 1: Implement TripRoom Durable Object**
 
 ```typescript
 // worker/src/TripRoom.ts
-import { refreshAccessToken, fetchCurrentlyPlaying } from './spotify'
-import { createSong, upsertRating, getTripById } from './db'
+import { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, NoActiveDeviceError } from './spotify'
+import { createSong, upsertRating, getTripById, getRatingSummary } from './db'
+import { generateSongBatch } from './claude'
 import { generateId } from './utils'
-import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState, SpotifyTrack } from './types'
+import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState, SpotifyTrack, SeedPrefs } from './types'
 
-const MIN_FLOOR_MS = 20 * 1000        // min rating time per song; doubles as anti-flicker for rapid skips
-const MAX_CAP_MS = 5 * 60 * 1000      // safety cap so a song left playing/paused forever still reveals
-const FALLBACK_WINDOW_MS = 90 * 1000  // used when Spotify omits duration/progress
+const MIN_FLOOR_MS = 20 * 1000        // floor a window so very short tracks still get rating time
+const MAX_CAP_MS = 6 * 60 * 1000      // safety cap so a stuck/paused song still reveals
+const FALLBACK_WINDOW_MS = 90 * 1000  // used when a resolved track somehow lacks a duration
 const POLL_INTERVAL_MS = 5 * 1000     // 5 seconds
+const BATCH_SIZE = 5                   // songs Claude returns per generateSongBatch call
+const PREFETCH_AT = 1                  // when queue length drops to this, prefetch the next batch
 const EMOJI_SCORES: Record<string, number> = {
   '🔥': 5, '❤️': 4, '😐': 3, '😬': 2, '💀': 1,
 }
@@ -1328,6 +1541,7 @@ interface Attachment {
 export class TripRoom implements DurableObject {
   private accessToken: string | null = null
   private tokenExpiresAt = 0
+  private generating = false   // guards against overlapping batch generations (prefetch + on-demand)
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -1348,9 +1562,17 @@ export class TripRoom implements DurableObject {
       return new Response('OK')
     }
 
-    if (url.pathname === '/start-polling') {
-      this.accessToken = null  // force token re-read now that DJ may have connected
+    // Pinged after Spotify OAuth callback (and by a creator "retry" after a
+    // playback_error). Re-read the token and (re)start the AI DJ.
+    if (url.pathname === '/start-djing') {
+      this.accessToken = null  // force token re-read now that the DJ has connected
       await this.ensurePolling()
+      // Only kick off playback if nothing is currently playing (avoids double-starts
+      // on retry). advanceToNextSong is a no-op-safe entry point.
+      const current = await this.ctx.storage.get<SongInfo>('currentSong')
+      const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+      const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
+      if (!current || !windowOpen) await this.advanceToNextSong()
       return new Response('OK')
     }
 
@@ -1447,22 +1669,26 @@ export class TripRoom implements DurableObject {
   }
 
   async alarm(): Promise<void> {
-    const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-    if (windowEndsAt && Date.now() >= windowEndsAt) {
-      await this.revealRatings()
-    }
-
-    // Stop the poll loop when nobody is connected. Otherwise every trip's DO polls
-    // Spotify every 5s forever, never meaningfully hibernates, and accrues duration
-    // cost indefinitely (SQLite-backed DO storage + duration billing is live as of 2026).
-    // Ratings are already persisted to D1, so there's nothing to lose by pausing.
-    // Polling resumes via ensurePolling() the next time a participant connects.
+    // Stop the loop when nobody is connected (billing guard). Ratings are already in
+    // D1 and the queue is in DO storage — nothing is lost. Resumes via ensurePolling()
+    // the next time a participant connects.
     if (this.ctx.getWebSockets().length === 0) return
 
     try {
-      await this.pollSpotify()
+      const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+      if (windowEndsAt && Date.now() >= windowEndsAt) {
+        // The current song's window elapsed → reveal, then play the next one.
+        await this.revealRatings()
+        await this.advanceToNextSong()
+      } else if (windowEndsAt) {
+        // Window still open — light sync only: catch a manual skip/stop on the DJ's
+        // own device so raters aren't stuck on a song that already ended.
+        await this.reconcilePlayback()
+      }
+      // Keep the next batch ready so a batch boundary never stalls playback.
+      await this.maybePrefetch()
     } catch (e) {
-      console.error('Spotify poll error:', e)
+      console.error('AI-DJ alarm error:', e)
     }
     await this.ctx.storage.setAlarm(Date.now() + POLL_INTERVAL_MS)
   }
@@ -1480,52 +1706,64 @@ export class TripRoom implements DurableObject {
     await this.ctx.storage.delete('windowEndsAt')
   }
 
-  // Polled every 5s by alarm(), INCLUDING while a window is open, so a DJ skip
-  // closes the current window early instead of leaving raters stuck on a song
-  // that is no longer playing. Reconciles the stored currentSong against what
-  // Spotify is actually playing:
-  //   - no track playing (paused/nothing/podcast) → leave any open window be (the
-  //     cap reveal in alarm() still fires). Matches the validated spike: pause keeps
-  //     currentSong, resume doesn't re-broadcast.
-  //   - same track as currentSong → nothing to do; people are rating.
-  //   - different track, min-floor elapsed → reveal current, open a window for the new one.
-  //   - different track, within min-floor → ignore (anti-flicker for rapid skips).
-  private async pollSpotify(): Promise<void> {
+  // Light sync: while our window is open, detect a manual skip/stop on the DJ's device.
+  //   - paused / nothing → leave the window (the cap reveal in alarm() still fires)
+  //   - same track → people are rating, nothing to do
+  //   - different track → the DJ took manual control; close our window and resume the AI DJ
+  private async reconcilePlayback(): Promise<void> {
     const token = await this.getAccessToken()
     if (!token) return
-
     const track = await fetchCurrentlyPlaying(token)
-    if (!track) return  // paused / nothing / non-track — don't disturb an open window
-
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
-    if (currentSong?.spotifyTrackId === track.id) return  // same song still playing
-
-    // Different track (or the very first song). Respect the min-floor so a burst
-    // of skips doesn't spam reveals and every song gets a minimum rating window.
-    const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-    const windowStartedAt = await this.ctx.storage.get<number>('windowStartedAt')
-    const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
-    if (windowOpen && windowStartedAt && Date.now() - windowStartedAt < MIN_FLOOR_MS) return
-
-    // DJ moved on — close the current window early before opening the next.
-    if (windowOpen) await this.revealRatings()
-
-    const tripId = await this.ctx.storage.get<string>('tripId')
-    if (!tripId) return
-
-    await this.startWindow(tripId, track)
+    if (!currentSong || !track || track.id === currentSong.spotifyTrackId) return
+    await this.revealRatings()
+    await this.advanceToNextSong()
   }
 
-  private async startWindow(tripId: string, track: SpotifyTrack): Promise<void> {
-    // Persist the song to D1 (source of truth), then open a window sized to the
-    // song's REMAINING play time so the countdown tracks the song ending.
+  // Plays the next queued track on the DJ's device and opens its rating window.
+  // Generates + resolves a fresh batch first if the queue is empty.
+  private async advanceToNextSong(): Promise<void> {
+    const tripId = await this.ctx.storage.get<string>('tripId')
+    if (!tripId) return
+    const token = await this.getAccessToken()
+    if (!token) return  // DJ hasn't connected Spotify yet — nothing to play
+
+    let queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
+    if (queue.length === 0) {
+      queue = await this.generateAndEnqueueBatch(tripId, token)
+      if (queue.length === 0) return  // nothing resolved this round — retry next alarm
+    }
+
+    const track = queue.shift()!
+    await this.ctx.storage.put('queue', queue)
+
+    // Play it BEFORE opening the window so the countdown matches real audio.
+    // No active device → put the track back and tell the creator to open Spotify.
+    try {
+      await startPlayback(token, track.uri)
+    } catch (e) {
+      queue.unshift(track)
+      await this.ctx.storage.put('queue', queue)
+      if (e instanceof NoActiveDeviceError) {
+        await this.ctx.storage.put('djActive', false)
+        this.broadcastAll({ type: 'playback_error', reason: 'No active Spotify device. Open Spotify, press play once, then retry.' })
+        return
+      }
+      throw e
+    }
+    await this.ctx.storage.put('djActive', true)
+
+    const playOrder = (await this.ctx.storage.get<number>('playOrder')) ?? 0
     const song = await createSong(this.env.DB, {
       id: generateId(),
       trip_id: tripId,
       spotify_track_id: track.id,
+      spotify_uri: track.uri,
       title: track.title,
       artist: track.artist,
       album_art: track.album_art,
+      reason: track.reason ?? null,
+      play_order: playOrder,
     })
 
     const newSong: SongInfo = {
@@ -1534,16 +1772,23 @@ export class TripRoom implements DurableObject {
       title: track.title,
       artist: track.artist,
       albumArt: track.album_art,
+      reason: track.reason ?? null,
     }
 
-    const remaining = track.duration_ms > 0 ? track.duration_ms - track.progress_ms : FALLBACK_WINDOW_MS
-    const windowMs = Math.min(MAX_CAP_MS, Math.max(MIN_FLOOR_MS, remaining || FALLBACK_WINDOW_MS))
+    const duration = track.duration_ms > 0 ? track.duration_ms : FALLBACK_WINDOW_MS
+    const windowMs = Math.min(MAX_CAP_MS, Math.max(MIN_FLOOR_MS, duration))
     const now = Date.now()
     const windowEnd = now + windowMs
+
+    // Remember every played track (even unrated ones) so re-plan never repeats them.
+    const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
+    played.push({ title: track.title, artist: track.artist })
 
     await this.ctx.storage.put('currentSong', newSong)
     await this.ctx.storage.put('windowStartedAt', now)
     await this.ctx.storage.put('windowEndsAt', windowEnd)
+    await this.ctx.storage.put('playOrder', playOrder + 1)
+    await this.ctx.storage.put('played', played)
     await this.ctx.storage.delete(`ratings:${song.id}`)
 
     this.broadcastAll({
@@ -1552,6 +1797,51 @@ export class TripRoom implements DurableObject {
       windowEndsAt: windowEnd,
       participantCount: this.ctx.getWebSockets().length,
     })
+  }
+
+  // Asks Claude for the next batch, resolves each pick to a real track via Spotify
+  // search (dropping unfindable picks), appends the resolved tracks to the queue, and
+  // returns the merged queue. Guarded so prefetch and on-demand calls don't overlap.
+  private async generateAndEnqueueBatch(tripId: string, token: string): Promise<SpotifyTrack[]> {
+    if (this.generating) return (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
+    this.generating = true
+    try {
+      const seed = await this.getSeedPrefs(tripId)
+      const history = await getRatingSummary(this.env.DB, tripId)   // rated songs + avg score (adaptation)
+      const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
+      const picks = await generateSongBatch(seed, history, played, this.env.CLAUDE_API_KEY, BATCH_SIZE)
+
+      const resolved: SpotifyTrack[] = []
+      for (const pick of picks) {
+        const track = await searchTrack(token, pick.title, pick.artist)
+        if (track) resolved.push({ ...track, reason: pick.reason })
+      }
+      const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
+      const merged = [...queue, ...resolved]
+      await this.ctx.storage.put('queue', merged)
+      return merged
+    } finally {
+      this.generating = false
+    }
+  }
+
+  // Prefetch the next batch in the background when the queue runs low, so playback
+  // doesn't pause at a batch boundary while we call Claude + Spotify search.
+  private async maybePrefetch(): Promise<void> {
+    if (this.generating) return
+    const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
+    if (queue.length > PREFETCH_AT) return
+    const tripId = await this.ctx.storage.get<string>('tripId')
+    const token = await this.getAccessToken()
+    if (!tripId || !token) return
+    this.ctx.waitUntil(this.generateAndEnqueueBatch(tripId, token).then(() => {}))
+  }
+
+  private async getSeedPrefs(tripId: string): Promise<SeedPrefs> {
+    const fallback: SeedPrefs = { genres: [], decades: [], energy: 3 }
+    const trip = await getTripById(this.env.DB, tripId)
+    if (!trip?.seed_prefs) return fallback
+    try { return { ...fallback, ...(JSON.parse(trip.seed_prefs) as Partial<SeedPrefs>) } } catch { return fallback }
   }
 
   private async getAccessToken(): Promise<string | null> {
@@ -1593,6 +1883,7 @@ export class TripRoom implements DurableObject {
       tripName,
       shortCode,
       djConnected: !!trip?.spotify_refresh_token,
+      djActive: (await this.ctx.storage.get<boolean>('djActive')) ?? true,
       participants: this.ctx.getWebSockets().map(s => {
         const att = s.deserializeAttachment() as Attachment
         return { id: att.participantId, name: att.participantName }
@@ -1637,7 +1928,7 @@ export class TripRoom implements DurableObject {
 
 ```bash
 git add worker/src/TripRoom.ts
-git commit -m "feat: TripRoom DO — WS hub, Spotify polling, direct D1 song/rating writes" && git push
+git commit -m "feat: TripRoom DO — AI-DJ orchestration (batch/replan/playback), WS hub, direct D1 writes" && git push
 ```
 
 ---
@@ -1659,8 +1950,9 @@ The Worker handles (all same-origin — no CORS needed):
 - `POST /api/trips/:code/join` → create participant
 - `GET /api/trips/:code/leaderboard` → songs + ratings + scores (single JOIN)
 - `GET /api/trips/:code/analysis` → cached Claude analysis (unlocks at 10 rated songs)
+- `POST /api/trips/:code/retry-dj` → re-kick the AI DJ after a `playback_error` (no active device)
 - `GET /api/spotify/login?tripId=...` → 302 redirect to Spotify authorize
-- `GET /api/spotify/callback?code=...&state=tripId` → exchange code, store token, start DO polling, redirect to trip
+- `GET /api/spotify/callback?code=...&state=tripId` → exchange code, store token, start the AI DJ (`/start-djing`), redirect to trip
 - `GET /ws?tripId=...&participantId=...&participantName=...` → upgrade to DO WebSocket
 
 There is **no** `/songs`, `/register-song`, or `/rate` route — the DO owns those writes.
@@ -1677,11 +1969,11 @@ import {
 import { generateShortCode, generateId, json, err } from './utils'
 import { exchangeCodeForToken } from './spotify'
 import { generatePersonality, generateGroupTaste } from './claude'
-import type { Env } from './types'
+import type { Env, SeedPrefs } from './types'
 
 export { TripRoom }
 
-const SPOTIFY_SCOPES = 'user-read-currently-playing user-read-playback-state'
+const SPOTIFY_SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing'
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -1731,9 +2023,9 @@ async function spotifyCallback(url: URL, env: Env): Promise<Response> {
   const tokens = await exchangeCodeForToken(env.SPOTIFY_CLIENT_ID, env.SPOTIFY_CLIENT_SECRET, code, redirectUri)
   await setTripSpotifyToken(env.DB, tripId, tokens.refresh_token)
 
-  // Kick the DO to re-read the token and start polling
+  // Kick the DO to re-read the token and start the AI DJ (first batch + playback)
   const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(tripId))
-  await stub.fetch('https://do/start-polling', { method: 'POST' })
+  await stub.fetch('https://do/start-djing', { method: 'POST' })
 
   return Response.redirect(`${url.origin}/trip/${trip.short_code}`, 302)
 }
@@ -1746,20 +2038,38 @@ async function handleApi(url: URL, method: string, request: Request, env: Env): 
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'join' && method === 'POST') return joinTripHandler(parts[1], request, env)
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'leaderboard' && method === 'GET') return leaderboardHandler(parts[1], env)
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'analysis' && method === 'GET') return analysisHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'retry-dj' && method === 'POST') return retryDjHandler(parts[1], env)
 
   return err('Not found', 404)
 }
 
+// Creator pressed "Retry" after a playback_error (no active device). Re-kick the DO.
+async function retryDjHandler(code: string, env: Env): Promise<Response> {
+  const trip = await getTripByCode(env.DB, code.toUpperCase())
+  if (!trip) return err('Trip not found', 404)
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
+  await stub.fetch('https://do/start-djing', { method: 'POST' })
+  return json({ ok: true })
+}
+
 async function createTripHandler(request: Request, env: Env): Promise<Response> {
-  const body = await request.json<{ name: string; creatorName: string }>()
+  const body = await request.json<{ name: string; creatorName: string; seedPrefs?: SeedPrefs }>()
   if (!body.name?.trim()) return err('name required')
   if (!body.creatorName?.trim()) return err('creatorName required')
+
+  // Normalize/validate the seed flavours (all fields optional → sane defaults).
+  const seed: SeedPrefs = {
+    genres: Array.isArray(body.seedPrefs?.genres) ? body.seedPrefs!.genres.slice(0, 10) : [],
+    decades: Array.isArray(body.seedPrefs?.decades) ? body.seedPrefs!.decades.slice(0, 10) : [],
+    energy: Math.min(5, Math.max(1, Math.round(Number(body.seedPrefs?.energy) || 3))),
+  }
 
   const trip = await createTrip(env.DB, {
     id: generateId(),
     name: body.name.trim(),
     short_code: generateShortCode(),
     creator_name: body.creatorName.trim(),
+    seed_prefs: JSON.stringify(seed),
     spotify_refresh_token: null,
   })
 
@@ -1781,6 +2091,7 @@ async function getTripHandler(code: string, env: Env): Promise<Response> {
       name: trip.name,
       short_code: trip.short_code,
       creator_name: trip.creator_name,
+      seedPrefs: trip.seed_prefs ? JSON.parse(trip.seed_prefs) : null,
       created_at: trip.created_at,
       djConnected: !!trip.spotify_refresh_token,
     },
@@ -1898,7 +2209,7 @@ Expected: `{"trip":{"id":"...","short_code":"XXXXXX",...}}`. Then `curl http://l
 
 ```bash
 git add worker/src/index.ts
-git commit -m "feat: Worker routes — trips, leaderboard, cached analysis, Spotify OAuth, WS upgrade" && git push
+git commit -m "feat: Worker routes — trips + seed prefs, leaderboard, cached analysis, Spotify OAuth (playback scope), WS upgrade" && git push
 ```
 
 ---
@@ -1925,6 +2236,7 @@ export interface SongInfo {
   title: string
   artist: string
   albumArt: string | null
+  reason: string | null   // why the AI DJ picked it (shown under the title + on the reveal)
 }
 
 export interface RatingInfo {
@@ -1939,6 +2251,7 @@ export interface TripState {
   tripName: string
   shortCode: string
   djConnected: boolean
+  djActive: boolean   // creator's Spotify device reachable (false after a playback_error until retry)
   participants: { id: string; name: string }[]
   currentSong: SongInfo | null
   windowEndsAt: number | null
@@ -1952,11 +2265,22 @@ export type ServerMessage =
   | { type: 'song_started'; song: SongInfo; windowEndsAt: number; participantCount: number }
   | { type: 'rating_update'; ratedCount: number; totalCount: number }
   | { type: 'rating_reveal'; songId: string; ratings: RatingInfo[]; averageScore: number }
+  | { type: 'playback_error'; reason: string }
   | { type: 'pong' }
 
 export type ClientMessage =
   | { type: 'ping' }
   | { type: 'rate'; songId: string; emoji: string; score: number }
+
+export interface SeedPrefs {
+  genres: string[]
+  decades: string[]
+  energy: number   // 1–5
+}
+
+// Preset options for the create-trip flavour pickers.
+export const GENRE_OPTIONS = ['Pop', 'Hip-Hop', 'Rock', 'Indie', 'R&B', 'Electronic', 'Country', 'Latin', 'Metal', 'Jazz', 'Classical', 'Reggae'] as const
+export const DECADE_OPTIONS = ['60s', '70s', '80s', '90s', '2000s', '2010s', '2020s'] as const
 
 export interface LeaderboardEntry {
   song: { id: string; title: string; artist: string; albumArt: string | null; identified_at: number }
@@ -2004,6 +2328,7 @@ interface TripStore {
   tripName: string
   shortCode: string
   djConnected: boolean
+  djActive: boolean   // creator's Spotify device reachable (false after a playback_error until retry)
   participants: { id: string; name: string }[]
   currentSong: SongInfo | null
   windowEndsAt: number | null
@@ -2019,6 +2344,7 @@ interface TripStore {
   setRatingUpdate: (ratedCount: number, totalCount: number) => void
   setReveal: (songId: string, ratings: RatingInfo[], averageScore: number) => void
   setMyRating: (emoji: string) => void
+  setPlaybackError: (reason: string | null) => void
 }
 
 export const useTripStore = create<TripStore>((set) => ({
@@ -2029,6 +2355,8 @@ export const useTripStore = create<TripStore>((set) => ({
   tripName: '',
   shortCode: '',
   djConnected: false,
+  djActive: true,
+  playbackError: null,
   participants: [],
   currentSong: null,
   windowEndsAt: null,
@@ -2046,6 +2374,7 @@ export const useTripStore = create<TripStore>((set) => ({
       tripName: state.tripName,
       shortCode: state.shortCode,
       djConnected: state.djConnected,
+      djActive: state.djActive,
       participants: state.participants,
       currentSong: state.currentSong,
       windowEndsAt: state.windowEndsAt,
@@ -2060,8 +2389,9 @@ export const useTripStore = create<TripStore>((set) => ({
       return { participants: [...s.participants, p], totalCount: s.totalCount + 1 }
     }),
 
+  // A song playing means the AI DJ reached the device — clear any prior playback error.
   setSongStarted: (song, windowEndsAt, participantCount) =>
-    set({ currentSong: song, windowEndsAt, ratedCount: 0, totalCount: participantCount, myRating: null, lastReveal: null, djConnected: true }),
+    set({ currentSong: song, windowEndsAt, ratedCount: 0, totalCount: participantCount, myRating: null, lastReveal: null, djConnected: true, djActive: true, playbackError: null }),
 
   setRatingUpdate: (ratedCount, totalCount) => set({ ratedCount, totalCount }),
 
@@ -2069,6 +2399,8 @@ export const useTripStore = create<TripStore>((set) => ({
     set({ lastReveal: { songId, ratings, averageScore }, windowEndsAt: null }),
 
   setMyRating: (emoji) => set({ myRating: emoji }),
+
+  setPlaybackError: (reason) => set({ playbackError: reason, djActive: reason === null }),
 }))
 ```
 
@@ -2076,7 +2408,7 @@ export const useTripStore = create<TripStore>((set) => ({
 
 ```bash
 git add frontend/src/types.ts frontend/src/hooks/useTripStore.ts
-git commit -m "feat: frontend types and Zustand trip store (djConnected, lastReveal)" && git push
+git commit -m "feat: frontend types and Zustand trip store (seed prefs, djActive, playbackError, lastReveal)" && git push
 ```
 
 ---
@@ -2129,6 +2461,7 @@ export function useWebSocket(tripId: string | null, participantId: string | null
       else if (msg.type === 'song_started') store.setSongStarted(msg.song, msg.windowEndsAt, msg.participantCount)
       else if (msg.type === 'rating_update') store.setRatingUpdate(msg.ratedCount, msg.totalCount)
       else if (msg.type === 'rating_reveal') store.setReveal(msg.songId, msg.ratings, msg.averageScore)
+      else if (msg.type === 'playback_error') store.setPlaybackError(msg.reason)
     }
 
     ws.onclose = () => {
@@ -2322,17 +2655,50 @@ export default function Home() {
 ```tsx
 // frontend/src/components/CreateTripForm.tsx
 import { useState } from 'react'
+import { GENRE_OPTIONS, DECADE_OPTIONS } from '../types'
 
 interface Props {
   onCreated: (participantId: string, participantName: string, tripCode: string, tripId: string) => void
   onBack: () => void
 }
 
+// Small multi-select chip row used for both genres and decades.
+function ChipRow({ options, selected, onToggle }: { options: readonly string[]; selected: string[]; onToggle: (v: string) => void }) {
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+      {options.map(opt => {
+        const on = selected.includes(opt)
+        return (
+          <button
+            key={opt}
+            type="button"
+            onClick={() => onToggle(opt)}
+            style={{
+              padding: '6px 12px', fontSize: 13, borderRadius: 20,
+              background: on ? 'var(--accent)' : 'var(--surface2)',
+              color: on ? 'white' : 'var(--text)',
+              border: on ? '1px solid var(--accent)' : '1px solid #333',
+            }}
+          >
+            {opt}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function CreateTripForm({ onCreated, onBack }: Props) {
   const [tripName, setTripName] = useState('')
   const [yourName, setYourName] = useState('')
+  const [genres, setGenres] = useState<string[]>([])
+  const [decades, setDecades] = useState<string[]>([])
+  const [energy, setEnergy] = useState(3)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+
+  const toggle = (list: string[], set: (v: string[]) => void, v: string) =>
+    set(list.includes(v) ? list.filter(x => x !== v) : [...list, v])
 
   const submit = async () => {
     if (!tripName.trim() || !yourName.trim()) return
@@ -2342,7 +2708,11 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
       const res = await fetch('/api/trips', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: tripName.trim(), creatorName: yourName.trim() }),
+        body: JSON.stringify({
+          name: tripName.trim(),
+          creatorName: yourName.trim(),
+          seedPrefs: { genres, decades, energy },
+        }),
       })
       const data = (await res.json()) as { trip: { id: string; short_code: string } }
 
@@ -2371,8 +2741,20 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
         <div className="label">Your name (you're the DJ)</div>
         <input value={yourName} onChange={e => setYourName(e.target.value)} placeholder="e.g. Boaz" />
       </div>
+      <div>
+        <div className="label">Genres the AI DJ should pull from</div>
+        <ChipRow options={GENRE_OPTIONS} selected={genres} onToggle={v => toggle(genres, setGenres, v)} />
+      </div>
+      <div>
+        <div className="label">Decades</div>
+        <ChipRow options={DECADE_OPTIONS} selected={decades} onToggle={v => toggle(decades, setDecades, v)} />
+      </div>
+      <div>
+        <div className="label">Energy: {['Chill', 'Mellow', 'Balanced', 'Upbeat', 'High'][energy - 1]}</div>
+        <input type="range" min={1} max={5} value={energy} onChange={e => setEnergy(Number(e.target.value))} style={{ width: '100%' }} />
+      </div>
       <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
-        Next you'll connect your Spotify so your playback drives the ratings.
+        Next you'll connect your Spotify so the AI DJ can play its picks on your device (Premium + an open Spotify app required).
       </div>
       {error && <div style={{ color: '#f44', fontSize: 14 }}>{error}</div>}
       <button className="btn-primary" onClick={submit} disabled={loading || !tripName.trim() || !yourName.trim()}>
@@ -2456,7 +2838,7 @@ export default function JoinTripForm({ onJoined, onBack, prefillCode }: Props) {
 
 ```bash
 git add frontend/src/
-git commit -m "feat: Home page — create (→ Spotify OAuth) and join forms" && git push
+git commit -m "feat: Home page — create form with seed flavours (→ Spotify OAuth) and join form" && git push
 ```
 
 ---
@@ -2499,7 +2881,7 @@ export default function Trip() {
   const [showQR, setShowQR] = useState(false)
   const [creatorName, setCreatorName] = useState<string | null>(null)
 
-  const { participantId, participantName, tripId, tripName, shortCode, djConnected, currentSong } = useTripStore()
+  const { participantId, participantName, tripId, tripName, shortCode, djConnected, currentSong, playbackError } = useTripStore()
   const { sendRating, isConnected } = useWebSocket(tripId, participantId, participantName)
 
   // Restore identity from sessionStorage (e.g. after Spotify OAuth round-trip) or redirect to join
@@ -2526,7 +2908,7 @@ export default function Trip() {
         if (!s.tripId) {
           s.applyStateSync({
             tripId: trip.id, tripName: trip.name, shortCode: trip.short_code,
-            djConnected: trip.djConnected, participants: [], currentSong: null,
+            djConnected: trip.djConnected, djActive: true, participants: [], currentSong: null,
             windowEndsAt: null, ratedCount: 0, myRating: null,
           })
         }
@@ -2558,6 +2940,22 @@ export default function Trip() {
         </div>
         <button onClick={() => setShowQR(true)} style={{ background: 'var(--surface2)', color: 'var(--text)', fontSize: 12, padding: '6px 12px' }}>Share</button>
       </div>
+
+      {playbackError && isCreator && (
+        <div style={{ margin: '8px 16px 0', background: 'rgba(244,67,54,0.12)', border: '1px solid rgba(244,67,54,0.4)', borderRadius: 10, padding: '10px 14px', fontSize: 13 }}>
+          <div style={{ marginBottom: 8 }}>{playbackError}</div>
+          <button
+            className="btn-primary"
+            style={{ padding: '6px 14px', fontSize: 13 }}
+            onClick={async () => {
+              await fetch(`/api/trips/${code}/retry-dj`, { method: 'POST' }).catch(() => {})
+              useTripStore.getState().setPlaybackError(null)
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
         {showDjPrompt && <ConnectSpotify tripId={tripId} isCreator={isCreator} creatorName={creatorName} />}
@@ -2657,7 +3055,7 @@ export default function ConnectSpotify({ tripId, isCreator, creatorName }: Props
       {isCreator ? (
         <>
           <div style={{ fontSize: 18, marginBottom: 8, color: 'var(--text)' }}>Connect your Spotify to start</div>
-          <div style={{ fontSize: 14, marginBottom: 24 }}>Your playback will trigger ratings for everyone.</div>
+          <div style={{ fontSize: 14, marginBottom: 24 }}>The AI DJ plays its picks on your device. Premium + an open Spotify app required.</div>
           <button className="btn-primary" style={{ maxWidth: 280, margin: '0 auto' }} onClick={() => { window.location.href = `/api/spotify/login?tripId=${tripId}` }}>
             Connect Spotify
           </button>
@@ -2665,7 +3063,7 @@ export default function ConnectSpotify({ tripId, isCreator, creatorName }: Props
       ) : (
         <>
           <div style={{ fontSize: 18, marginBottom: 8, color: 'var(--text)' }}>Waiting for the DJ</div>
-          <div style={{ fontSize: 14 }}>{creatorName ?? 'The creator'} needs to connect Spotify before songs appear.</div>
+          <div style={{ fontSize: 14 }}>{creatorName ?? 'The creator'} needs to connect Spotify before the AI DJ starts.</div>
         </>
       )}
     </div>
@@ -2746,8 +3144,8 @@ interface Props {
 
 export default function CountdownTimer({ endsAt, onExpire }: Props) {
   const [remaining, setRemaining] = useState(() => Math.max(0, endsAt - Date.now()))
-  // Capture this window's length so the progress bar scales to it. Windows are now
-  // variable-length (sized to the song's remaining play time), not a fixed 2 min.
+  // Capture this window's length so the progress bar scales to it. Windows are
+  // variable-length (sized to the AI DJ's current song duration), not a fixed 2 min.
   // Reset whenever endsAt changes (a new song reuses this component instance).
   const totalRef = useRef(Math.max(1, endsAt - Date.now()))
 
@@ -2849,8 +3247,8 @@ export default function CurrentSong({ onRate }: Props) {
     return (
       <div style={{ textAlign: 'center', paddingTop: 80, color: 'var(--text-dim)' }}>
         <div style={{ fontSize: 48, marginBottom: 16 }}>🎵</div>
-        <div style={{ fontSize: 18, marginBottom: 8 }}>Waiting for a song...</div>
-        <div style={{ fontSize: 14 }}>The DJ's Spotify will trigger ratings automatically</div>
+        <div style={{ fontSize: 18, marginBottom: 8 }}>The AI DJ is picking the first song...</div>
+        <div style={{ fontSize: 14 }}>Songs are chosen from the DJ's seed taste and adapt to your ratings</div>
       </div>
     )
   }
@@ -2884,6 +3282,9 @@ export default function CurrentSong({ onRate }: Props) {
       <div style={{ textAlign: 'center', marginBottom: 16 }}>
         <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{currentSong.title}</div>
         <div style={{ fontSize: 16, color: 'var(--text-dim)' }}>{currentSong.artist}</div>
+        {currentSong.reason && (
+          <div style={{ fontSize: 13, color: 'var(--accent)', marginTop: 6, fontStyle: 'italic' }}>🤖 {currentSong.reason}</div>
+        )}
       </div>
 
       {isWindowOpen && windowEndsAt && <CountdownTimer endsAt={windowEndsAt} />}
@@ -3106,7 +3507,7 @@ ls worker/src/index.ts frontend/src/components/Analysis.tsx
 pnpm install
 ```
 
-Per CLAUDE.md, API-level integration tests (via the `SELF` binding) are the **primary** backend strategy. These would have caught the persistence bugs in the first draft. We add the cross-layer HTTP tests here plus two focused frontend behavior tests. (The Spotify-poll path needs a live Spotify session and is covered by the Playwright E2E in Task 16.)
+Per CLAUDE.md, API-level integration tests (via the `SELF` binding) are the **primary** backend strategy. These would have caught the persistence bugs in the first draft. We add the cross-layer HTTP tests here plus two focused frontend behavior tests. (The AI-DJ orchestration path — Claude batch + Spotify search/playback — needs live credentials and is covered by the Playwright E2E in Task 16; the pure pieces `searchTrack`/`generateSongBatch` are unit-tested in Tasks 4–5.)
 
 **Files:**
 - Create: `worker/test/api.test.ts`
@@ -3159,6 +3560,21 @@ describe('trip lifecycle', () => {
   it('returns 404 for unknown code', async () => {
     const res = await SELF.fetch('http://example.com/api/trips/ZZZZZZ')
     expect(res.status).toBe(404)
+  })
+
+  it('round-trips seed flavours through create → get', async () => {
+    const create = await SELF.fetch('http://example.com/api/trips', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'AI Trip', creatorName: 'Boaz',
+        seedPrefs: { genres: ['Hip-Hop', 'Indie'], decades: ['90s'], energy: 4 },
+      }),
+    })
+    const { trip } = await create.json<{ trip: { short_code: string } }>()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}`)
+    const data = await res.json<{ trip: { seedPrefs: { genres: string[]; decades: string[]; energy: number } } }>()
+    expect(data.trip.seedPrefs).toEqual({ genres: ['Hip-Hop', 'Indie'], decades: ['90s'], energy: 4 })
   })
 
   it('joins idempotently — same name returns the same participant id', async () => {
@@ -3283,7 +3699,7 @@ ls worker/test/api.test.ts
 pnpm install
 ```
 
-This task verifies the full stack end-to-end with the Playwright MCP tools, driving a real browser against a local `wrangler dev`. Because the live Spotify poll needs a connected account, the song-push step is simulated by exercising the UI states that are reachable without live Spotify, plus (optionally) a real OAuth + playback run if Spotify creds are in `worker/.dev.vars`.
+This task verifies the full stack end-to-end with the Playwright MCP tools, driving a real browser against a local `wrangler dev`. Because the AI DJ needs live Spotify (Premium + active device) and Claude credentials, the song-selection step is exercised against the reachable-without-credentials UI states, plus (optionally) a real OAuth + AI-DJ run if Spotify + Claude creds are in `worker/.dev.vars`.
 
 **Files:**
 - No new app files — this is a QA gate. Optionally record findings in `docs/superpowers/specs/`.
@@ -3306,15 +3722,15 @@ cd worker && npx wrangler dev --local
 - [ ] **Step 3: Drive the golden path with Playwright MCP**
 
 Using `mcp__playwright__*` tools, verify:
-1. `/` → create trip form → submit → redirected toward `/api/spotify/login` (creator OAuth entry). Screenshot.
+1. `/` → create trip form → pick a couple of genres + a decade + energy → submit → redirected toward `/api/spotify/login` (creator OAuth entry). Screenshot the flavour pickers.
 2. In a second context, open `/?join=<code>`, join as a different name → lands on `/trip/<code>` → sees "Waiting for the DJ" (djConnected=false). Screenshot.
 3. WebSocket connects (check `mcp__playwright__browser_network_requests` for the `/ws` upgrade and a `state_sync`).
 4. Reconnect toast appears when the Worker is stopped, clears when restarted.
 5. Leaderboard tab shows the empty state; Analysis tab is locked (🔒).
 
-- [ ] **Step 4 (optional, needs real Spotify creds in `worker/.dev.vars`): live song flow**
+- [ ] **Step 4 (optional, needs real Spotify + Claude creds in `worker/.dev.vars`): live AI-DJ flow**
 
-With a Spotify track playing on the connected account, confirm within ~10s a `song_started` arrives, the countdown shows, an emoji rating broadcasts `rating_update`, and at window close the reveal renders. Screenshot the reveal.
+Complete OAuth with a Premium account that has an **open Spotify app/active device**. Confirm within ~10s the AI DJ plays its first pick: a `song_started` arrives, the song's `🤖 reason` shows under the title, the countdown runs, an emoji rating broadcasts `rating_update`, and at window close the reveal renders and the next pick auto-plays. With **no** active device, confirm a `playback_error` banner + Retry appears for the creator. Screenshot the playing state and the reveal.
 
 - [ ] **Step 5: Commit**
 
@@ -3342,6 +3758,8 @@ In the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), c
 > - **Dev-mode user allowlist (5 users, Premium required).** New apps start in *Development Mode*: only Spotify accounts you explicitly add under **User Management** can complete OAuth, now capped at **5 users** (down from 25), and the developer account needs **Spotify Premium**. Since only the *DJ* authorizes, add each DJ's Spotify email here. There is effectively **no path to Extended Quota** for an individual (it now requires a registered business + 250k MAU), so this app is permanently limited to ≤5 DJ accounts and cannot be opened to the public.
 
 Add the redirect URI(s) you'll actually use (prod, and a tunnel URL if testing OAuth locally), add your DJ account email(s) under User Management, and note the Client ID and Client Secret.
+
+> **AI-DJ runtime requirements (hard constraints):** the OAuth scopes are `user-read-playback-state user-modify-playback-state user-read-currently-playing` (set in `index.ts`) — the **modify** scope is what lets the app `play` tracks on the DJ's device. The DJ must have **Spotify Premium** (playback control is Premium-only) **and an active device** (an open Spotify app on phone/desktop/car) the moment the AI DJ starts; otherwise the first `play` 404s and the app shows a `playback_error` + Retry until a device is available. No song audio can be started purely server-side without an already-running Spotify client.
 
 - [ ] **Step 2: Create the production D1 database**
 
@@ -3379,10 +3797,10 @@ Expected output includes `https://listening-road-trip.<your-account>.workers.dev
 
 - [ ] **Step 6: Smoke test production**
 
-1. `curl -X POST https://<app>.workers.dev/api/trips -H "Content-Type: application/json" -d '{"name":"Real Road Trip","creatorName":"Boaz"}'` → returns a trip.
-2. Open the app, create a trip → complete the Spotify OAuth → land back on the trip page.
-3. Start playing a song on Spotify → within ~10s `song_started` broadcasts.
-4. Join from a second device, rate, and confirm the reveal at window close.
+1. `curl -X POST https://<app>.workers.dev/api/trips -H "Content-Type: application/json" -d '{"name":"Real Road Trip","creatorName":"Boaz","seedPrefs":{"genres":["Indie"],"decades":["2010s"],"energy":3}}'` → returns a trip.
+2. Open the app, create a trip with seed flavours → complete the Spotify OAuth → land back on the trip page (with an open Spotify app on a Premium device).
+3. Within ~10s the AI DJ plays its first pick on your device → `song_started` broadcasts with a `reason`.
+4. Join from a second device, rate, and confirm the reveal at window close and that the next pick auto-plays.
 
 - [ ] **Step 7: Commit**
 
@@ -3397,7 +3815,7 @@ git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, v
 
 These product/architecture choices were surfaced by the critique and **resolved to their documented defaults on 2026-05-29**. They are **not** bugs — each was a deliberate call. Listed here so the rationale is recorded and not re-litigated mid-build.
 
-1. **Rating window vs. song length / skips** (Tasks 4, 6, 12) — **RESOLVED (revised 2026-05-30): (b)+(c) — the window tracks real playback.** *This reverses the earlier "keep it loose" call.* The fixed 2-min wall-clock window desynced ratings from playback: the DJ's music kept advancing while a window stayed open, so people rated a song that was no longer playing and intermediate songs were silently dropped. The window is now sized to the song's remaining play time (`duration_ms − progress_ms`, clamped to `[20s, 5min]`) **and** closes early when the DJ skips to a different track — the alarm now polls Spotify every 5s *even while a window is open*. A 20s min-floor guarantees rating time per song and prevents reveal-spam on rapid skips. (Rejected: (a) the original loose fixed-window behavior — the song/rating desync was too central to a *song*-rating game to accept.) Residual edge cases, accepted: a burst of skips within the 20s floor can still skip a song, and a song first detected with <20s left is floored to 20s of rating time after it has technically ended.
+1. **Rating window vs. song length / skips** (Tasks 4, 6, 12) — **SUPERSEDED by the AI-DJ pivot (Revision Note 4).** Now that the DO *drives* playback (it starts each track at position 0 via `startPlayback`), the window is simply sized to the song's **full duration**, clamped to `[20s, 6min]`. There's no progress/skip desync to fix in the common case because the app controls what plays. The earlier-resolved behavior (window = remaining play time; close-early-on-skip) is retained only as the **manual-skip fallback**: `reconcilePlayback()` polls `currently-playing` while a window is open and, if the DJ manually changes the track on their own device, closes the window early and resumes the AI DJ. Residual edge case, accepted: a very short track is floored to a 20s rating window.
 
 2. **Analysis cache strategy** (analysis route) — **RESOLVED: (b) regenerate only when the count crosses a +5 bucket.** The original count-exact key thrashed the cache mid-trip, re-billing ≈11 Claude calls on every newly rated song. Now keyed on `Math.floor(ratedSongsCount / 5)`, so analysis refreshes at 10, 15, 20, … rated songs and serves cached in between. **Implemented** in the analysis route (Task 7). (Rejected: (a) time TTL — count-bucket is simpler and deterministic; (c) accept thrashing — too slow/costly exactly when the tab is used.)
 
@@ -3410,34 +3828,37 @@ These product/architecture choices were surfaced by the critique and **resolved 
 ## Self-Review
 
 **Spec coverage:**
-- ✅ Trip creation with name + creator name
-- ✅ Per-trip Spotify OAuth (creator is the DJ)
+- ✅ Trip creation with name + creator name + structured seed flavours (genres/decades/energy)
+- ✅ Per-trip Spotify OAuth with playback-control scope (creator is the DJ)
 - ✅ Join by name only; shareable URL + QR code + short code
-- ✅ Spotify polling via Durable Object alarm, using the trip's own token
-- ✅ Auto song persistence + broadcast on song change (DO writes D1 directly)
-- ✅ Rating window tracks the song's remaining play time (countdown), closes early on DJ skip
+- ✅ AI DJ: Claude picks songs in batches from the seed + rating summary, re-planning as ratings accumulate
+- ✅ Picks resolved via Spotify search and **played on the creator's device** (`startPlayback`); prefetch keeps playback gapless
+- ✅ Auto song persistence + broadcast when each pick starts (DO writes D1 directly, incl. uri/reason/play_order)
+- ✅ Rating window sized to the song's duration (countdown); manual skip/stop on the DJ device closes it early
+- ✅ `playback_error` + Retry when no active device is reachable
 - ✅ 5 emoji ratings (🔥❤️😐😬💀) mapped to 1-5, persisted to D1
 - ✅ Rating changes within window; X/N counter live; choices hidden until reveal
-- ✅ Big reveal at window close
-- ✅ Current Song / Leaderboard (hall of shame) / Analysis tabs
+- ✅ Big reveal at window close, then the next pick auto-plays
+- ✅ Current Song (with the AI's `reason`) / Leaderboard (hall of shame) / Analysis tabs
 - ✅ Analysis unlocks at 10 rated songs; result cached (no Claude re-billing)
 - ✅ Claude-generated personality cards + group taste (inferred, no audio features)
 - ✅ Trip never ends; reconnecting toast on disconnect
 - ✅ API keys + Spotify secrets as Worker secrets
 - ✅ Cloudflare Workers + Durable Objects + D1; React frontend
 
-**Bugs fixed vs first draft:**
-- Songs & ratings now actually persist (DO has D1 access; bridge removed)
+**Bugs fixed / carried over from prior drafts:**
+- Songs & ratings persist (DO has D1 access; bridge removed)
 - `pong` is a real message type; no `error`-type hack
-- `isConnected` is reactive state (reconnect toast now works)
+- `isConnected` is reactive state (reconnect toast works)
 - Single-JOIN leaderboard (no N+1); cached analysis
 - No build-breaking unused `ctx`; no unnecessary CORS
-- Hardened `parseCurrentlyPlaying` (skips ads/podcasts)
+- Hardened `parseCurrentlyPlaying` (skips ads/podcasts; now used only for sync)
 - Deferred `wrangler d1 create` to deploy; added `.gitignore`; current deps
 
 **Known limitations (acceptable for v1):**
 - DJ is creator-only; no hand-off to another participant
 - `totalCount` counts live WebSocket connections, so a backgrounded tab can drop the denominator briefly
-- A track replayed immediately after itself won't re-trigger until a different track plays in between
-- A burst of skips within the 20s min-floor can still skip a song; a song detected with <20s of play left is floored to 20s of rating time
-- Spotify dev-mode cap (≤5 DJ accounts, Premium required) — the documented blocker to any public launch; fine at friends-only scale
+- Claude may name a song Spotify can't resolve → the pick is dropped and the batch re-plans sooner (occasional near-matches accepted)
+- No active device → playback can't start; surfaced as `playback_error` + Retry (we can't auto-start audio remotely)
+- Batch-boundary latency is hidden by prefetch, but a very fast crowd could still briefly out-run the queue
+- Spotify dev-mode cap (≤5 DJ accounts, Premium + active device required) — the documented blocker to any public launch; fine at friends-only scale

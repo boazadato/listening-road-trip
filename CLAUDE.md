@@ -2,7 +2,7 @@
 
 ## What We're Building
 
-Real-time road trip music rating app. The trip creator (the DJ) connects their own Spotify via in-app OAuth; their playback auto-broadcasts songs to the group via WebSocket. Everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
+Real-time road trip music rating app with an **AI DJ**. The trip creator seeds the playlist with structured taste preferences (genres / decades / energy), then connects their own Spotify via in-app OAuth so the AI DJ can play its picks **on the creator's Spotify device** (Premium + an active device required). Claude selects the songs in batches of ~5, re-planning the next batch from the accumulated ratings as the trip goes on. Each song the AI plays broadcasts to the group via WebSocket; everyone rates with 5 emojis. Leaderboard + Claude-generated taste analysis accumulate over the trip.
 
 **Implementation plan:** [`docs/superpowers/plans/2026-05-29-listening-road-trip.md`](docs/superpowers/plans/2026-05-29-listening-road-trip.md) — 17 tasks, each with exact file paths, code, and commit steps. The plan is the single source of truth for the task list (no separate issue tracker); identify the next task as the lowest-numbered one whose final commit isn't yet in `git log`.
 
@@ -12,8 +12,9 @@ Real-time road trip music rating app. The trip creator (the DJ) connects their o
 |---|---|
 | Frontend | React + Vite (served as static assets from Worker) |
 | Backend | Cloudflare Workers + Durable Objects + D1 (SQLite) |
-| Real-time | Durable Object per trip (WebSocket hub + Spotify polling alarm) |
-| Song detection | Spotify Web API (currently-playing only; per-trip OAuth — audio-features is deprecated and unused) |
+| Real-time | Durable Object per trip (WebSocket hub + AI-DJ orchestration alarm) |
+| Song selection | Claude API (batch picks, seeded by DJ flavours, re-planned from ratings) |
+| Spotify | Spotify Web API — track search + playback control + currently-playing (sync); per-trip OAuth. Audio-features is deprecated and unused. |
 | Taste analysis | Claude API (claude-haiku-4-5) |
 | Deploy | Cloudflare via `wrangler deploy` |
 | Package manager | pnpm workspaces (`worker/` + `frontend/`) |
@@ -164,11 +165,11 @@ cd worker && npx wrangler deploy
 
 ## Key Architecture Notes
 
-- **One Durable Object per trip** (keyed by `tripId`). Holds all WebSocket connections and runs the Spotify polling alarm every 5 seconds.
-- **Alarm loop**: `alarm()` fires every 5 seconds via `ctx.storage.setAlarm()`. Checks if the rating window expired (reveal) then polls Spotify — **including while a window is open**, so a DJ skip closes the current window early. The rating window is sized to the song's remaining play time (`duration_ms − progress_ms`, clamped `[20s, 5min]`), with a 20s min-floor as anti-flicker; a new/changed track broadcasts `song_started`.
-- **DO owns persistence (no bridge)**: The Durable Object receives the same `env` as the Worker, including the D1 binding. It writes songs (`createSong`) and ratings (`upsertRating`) **directly via `this.env.DB`** — there is no Worker round-trip, no `/songs`/`/register-song` route, no `songDbId` mapping. The `song_started` broadcast carries the real DB id created in `startWindow()` (called from `pollSpotify()`).
-- **Rating persistence**: Ratings are kept in DO storage during the window (fast X/N counting) and upserted to D1 in the same `handleRating()` call. DO storage survives cold starts; D1 is the source of truth for leaderboard/analysis.
-- **Per-trip Spotify OAuth**: One Spotify app (global `SPOTIFY_CLIENT_ID`/`SECRET`). The **creator** authorizes via `/api/spotify/login` → `/api/spotify/callback`, which stores a per-trip `refresh_token` on the trip row. The DO reads that token from D1 (cached in memory) to poll. No global refresh token. `/start-polling` is pinged after callback so the DO picks up the new token.
+- **One Durable Object per trip** (keyed by `tripId`). Holds all WebSocket connections and runs the AI-DJ orchestration alarm every 5 seconds.
+- **AI-DJ orchestration loop**: The DO *drives* playback rather than observing it. It keeps a `queue` of resolved upcoming tracks. `advanceToNextSong()` plays the next queued track on the DJ's Spotify device (`startPlayback`), writes it via `createSong`, and opens a rating window sized to the song's duration (clamped `[20s, MAX_CAP_MS]`), broadcasting `song_started`. When the queue is empty it calls Claude (`generateSongBatch`) with the seed prefs + accumulated rating summary, resolves each pick via Spotify `searchTrack` (dropping unresolvable picks), and enqueues. `alarm()` fires every 5s via `ctx.storage.setAlarm()`: when the current window elapses it reveals ratings then advances; it **prefetches** the next batch when `queue.length <= 1` (via `ctx.waitUntil`) so there is no gap. A light `currently-playing` poll only detects pause / manual skip and re-syncs the timer. The alarm still **stops when no sockets are connected** and resumes on reconnect.
+- **DO owns persistence (no bridge)**: The Durable Object receives the same `env` as the Worker, including the D1 binding. It writes songs (`createSong`) and ratings (`upsertRating`) **directly via `this.env.DB`** — there is no Worker round-trip, no `/songs`/`/register-song` route, no `songDbId` mapping. The `song_started` broadcast carries the real DB id created in `advanceToNextSong()`.
+- **Rating persistence**: Ratings are kept in DO storage during the window (fast X/N counting) and upserted to D1 in the same `handleRating()` call. DO storage survives cold starts; D1 is the source of truth for leaderboard/analysis and for the re-plan rating summary.
+- **Per-trip Spotify OAuth**: One Spotify app (global `SPOTIFY_CLIENT_ID`/`SECRET`). The **creator** authorizes via `/api/spotify/login` → `/api/spotify/callback` with scopes `user-read-playback-state user-modify-playback-state user-read-currently-playing`, which stores a per-trip `refresh_token` on the trip row. The DO reads that token from D1 (cached in memory) to control playback. No global refresh token. The DJ needs **Spotify Premium + an active device**; if no device is reachable, `startPlayback` 404s and the DO broadcasts `playback_error` so the creator UI prompts them to open Spotify and retry. `/start-djing` is pinged after callback so the DO picks up the new token and starts the first batch.
 - **Analysis caching**: `GET /api/trips/:code/analysis` caches its Claude result in the `analysis_cache` table and regenerates only when the rated-song count changes — avoids re-billing Claude on every tab open.
 - **Auth**: No user auth. Participants are identified by a generated `participantId` stored in `sessionStorage` (which also survives the Spotify OAuth redirect). Name collision = same participant, via `ON CONFLICT DO NOTHING` + lookup.
 
@@ -178,7 +179,9 @@ cd worker && npx wrangler deploy
 |---|---|
 | Add an API route | `worker/src/index.ts` |
 | Change WebSocket broadcast logic | `worker/src/TripRoom.ts` |
-| Change Spotify polling behavior | `worker/src/TripRoom.ts` → `alarm()` |
+| Change AI-DJ orchestration (batch/replan/playback) | `worker/src/TripRoom.ts` → `alarm()` + `advanceToNextSong()` |
+| Change the song-selection prompt | `worker/src/claude.ts` → `generateSongBatch` |
+| Change Spotify search / playback control | `worker/src/spotify.ts` |
 | Add a D1 query | `worker/src/db.ts` |
 | Change personality generation | `worker/src/claude.ts` |
 | Change rating UI | `frontend/src/components/CurrentSong.tsx` + `RatingButtons.tsx` |
