@@ -19,6 +19,18 @@ Real-time road trip music rating app with an **AI DJ**. The trip creator seeds t
 | Deploy | Cloudflare via `wrangler deploy` |
 | Package manager | pnpm workspaces (`worker/` + `frontend/`) |
 
+## Production
+
+| | |
+|---|---|
+| **URL** | https://listening-road-trip.boazadato.workers.dev |
+| **D1 database ID** | `d615a3b0-8740-4423-b7fd-071dc1d72221` |
+| **Spotify app** | Client ID `9835c46e2be746429918ff7e76633e7e` — redirect URI `https://listening-road-trip.boazadato.workers.dev/api/spotify/callback` |
+| **Secrets set** | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `CLAUDE_API_KEY` (via `wrangler secret put`) |
+| **Deploy command** | `cd frontend && pnpm build && cd .. && npx wrangler deploy` |
+
+**Verified working (2026-05-30):** create trip → seed flavours form → Spotify OAuth → trip page → AI DJ immediately picks songs from DJ's own Spotify favorites (DJ taste seed works) → song plays on Spotify device → emoji rating → reveal → next song auto-plays → Leaderboard tab → Share button.
+
 ## Local Dev Setup
 
 Requires **Node 22** (pinned in `.node-version` / `.nvmrc`; enforced via `engines` in the root `package.json`). With `nvm`/`fnm`/`asdf`, run `nvm use` (or let it auto-switch) before installing. pnpm is provisioned via Corepack (`packageManager: pnpm@9`).
