@@ -101,3 +101,22 @@ describe('spotify oauth', () => {
     expect(loc).toContain(`state=${trip.id}`)
   })
 })
+
+describe('skip endpoint', () => {
+  it('returns { ok: true } for an existing trip', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/skip`, {
+      method: 'POST',
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json<{ ok: boolean }>()
+    expect(data.ok).toBe(true)
+  })
+
+  it('returns 404 for an unknown trip code', async () => {
+    const res = await SELF.fetch('http://example.com/api/trips/ZZZZZZ/skip', {
+      method: 'POST',
+    })
+    expect(res.status).toBe(404)
+  })
+})

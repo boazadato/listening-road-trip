@@ -72,6 +72,19 @@ The AI DJ now selects songs from **three** taste inputs instead of one, so genre
 
 Process-only — no task content changed. Task completion is now tracked by an explicit status marker (⬜ todo · 🔄 in progress · ✅ done) on each task in the [Tasks](#tasks) list, and **this index is the single source of truth for status**. Previously "done" was inferred from `git log` ("lowest task whose final commit subject isn't in the log") — but commit subjects carry no machine-readable task link, so the match was manual and fuzzy. The marker is now flipped to ✅ **in the same commit** that completes the task (Session End), so status can't drift from the work: the doc change and the code change land together. The final commit subject stays next to each task as a cross-check. CLAUDE.md's "next task" rule points here, not at git history. Backfilled Tasks 1–4 as ✅ (their commits are in the log).
 
+### Revision Note 8 (2026-05-31, reverses the Note 3 frontend freeze)
+
+**Reverses the frontend-major freeze from Revision Note 3.** Note 3 deliberately left the frontend framework majors (vite 5, `@vitejs/plugin-react` 4, vitest 3, react 18, react-router-dom 6, zustand 4) frozen, calling major-jumps "unjustified migration risk at this scale." That freeze was re-opened and the risk was **measured empirically** rather than estimated: a throwaway git worktree spike bumped all of them to current and ran the full gate set with **zero source changes**.
+
+| Tier | Bumps | `pnpm install` peers | `tsc --noEmit` | `vitest run` | `vite build` |
+|---|---|---|---|---|---|
+| A (toolchain) | vite 5→6, plugin-react 4→5, vitest 3→4 | clean | exit 0 | 3/3 | ✓ |
+| B (full current) | Tier A **+** react 18→19, react-dom 18→19, `@types/react(-dom)`→19, react-router-dom 6→7, zustand 4→5 | clean | exit 0 | 3/3 | ✓ |
+
+Both tiers compiled, tested, and built clean because the code only ever used patterns that survive the majors: standard hooks / function components (React 19-safe), the **pure declarative** router API (`<BrowserRouter>/<Routes>/<Route>/useParams/useNavigate` — no `createBrowserRouter`/loaders, so RR7's library mode is a drop-in), and the named `import { create } from 'zustand'` (the v5-supported form). `@testing-library/react@16` already supports React 19.
+
+**Chosen scope: Tier B (full current)**, deferred — tracked as **Task 18**, not executed in the discovery session (product owner: "store as a task for later"). Benefits: monorepo unifies on one vitest major (worker is already on 4 via `@cloudflare/vitest-pool-workers ^0.16.3`), the Vite "CJS Node API deprecated" warning disappears, and the frontend stops carrying year-old majors. **Caveat that gates "done":** the static gates above do **not** equal runtime verification — the 3 unit tests cover only `CountdownTimer`/`tripStore`, not the WebSocket reconnect, Spotify OAuth redirect, or rating/reveal flows, and Tier B swaps the React + router *runtime*. Task 18 therefore requires re-running the Task 16 Playwright E2E golden path before its marker flips to ✅. The production bundle grows ≈30% gzipped (67 KB → 87 KB) — acceptable for a friends-only app, noted for honesty.
+
 ---
 
 ## Agent Session Protocol
@@ -195,6 +208,8 @@ The plan is split into one file per task under [`2026-05-29-listening-road-trip/
 - ✅ **Task 15** — [API Integration & Frontend Behavior Tests](2026-05-29-listening-road-trip/task-15-api-integration-frontend-tests.md) — `test: API integration (SELF) + frontend behavior tests`
 - ✅ **Task 16** — [Build & Playwright E2E (Golden Path)](2026-05-29-listening-road-trip/task-16-build-playwright-e2e.md) — `chore: E2E golden path verified via Playwright MCP`
 - ✅ **Task 17** — [Spotify App Setup & Deploy to Cloudflare](2026-05-29-listening-road-trip/task-17-spotify-app-setup-deploy.md) — `chore: production deploy — D1 id, Spotify OAuth app, secrets, verified`
+- ⬜ **Task 18** — [Frontend Dependency Modernization (Tier B: full current)](2026-05-29-listening-road-trip/task-18-frontend-dependency-modernization.md) — `chore: modernize frontend deps — vite 6, react 19, react-router 7, zustand 5, vitest 4` *(deferred; see Revision Note 8)*
+- ✅ **Task 19** — [Skip Song](2026-05-29-listening-road-trip/task-19-skip-song.md) — `feat: skip song — creator skip button + auto-skip on thumbs-down crowd`
 
 ---
 
