@@ -46,6 +46,7 @@ export class TripRoom implements DurableObject {
   private accessToken: string | null = null
   private tokenExpiresAt = 0
   private generating = false   // guards against overlapping batch generations (prefetch + on-demand)
+  private advancing = false    // guards against overlapping reveal+advance (alarm/skip/auto-skip)
   private djTaste: DjTasteTrack[] | null = null   // DJ's own Spotify favorites, fetched once at ride start (null = not yet loaded)
   deps: TripRoomDeps = DEFAULT_DEPS   // network collaborators; tests reassign via runInDurableObject (see Step 2)
 
@@ -85,8 +86,7 @@ export class TripRoom implements DurableObject {
     if (url.pathname === '/skip') {
       const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
       if (windowEndsAt) {            // a song is currently playing
-        await this.revealRatings()
-        await this.advanceToNextSong()
+        await this.advanceNow()
       }
       return new Response('OK')
     }
@@ -188,8 +188,7 @@ export class TripRoom implements DurableObject {
     const rated = Object.values(ratings)
     const avg = rated.reduce((s, r) => s + r.score, 0) / rated.length
     if (rated.length > total / 2 && avg < AUTO_SKIP_THRESHOLD) {
-      await this.revealRatings()
-      await this.advanceToNextSong()
+      await this.advanceNow()
     }
   }
 
@@ -203,8 +202,7 @@ export class TripRoom implements DurableObject {
       const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
       if (windowEndsAt && Date.now() >= windowEndsAt) {
         // The current song's window elapsed → reveal, then play the next one.
-        await this.revealRatings()
-        await this.advanceToNextSong()
+        await this.advanceNow()
       } else if (windowEndsAt) {
         // Window still open — light sync only: catch a manual skip/stop on the DJ's
         // own device so raters aren't stuck on a song that already ended.
@@ -216,6 +214,22 @@ export class TripRoom implements DurableObject {
       console.error('AI-DJ alarm error:', e)
     }
     await this.ctx.storage.setAlarm(Date.now() + POLL_INTERVAL_MS)
+  }
+
+  // Single entry point for all reveal+advance sequences. The `advancing` flag
+  // ensures concurrent triggers (alarm, /skip, auto-skip, reconcile) collapse
+  // to one in-flight call — the second caller returns immediately as a no-op.
+  private async advanceNow(): Promise<void> {
+    if (this.advancing) return
+    this.advancing = true
+    try {
+      await this.revealRatings()
+      await this.advanceToNextSong()
+    } catch (e) {
+      console.error('AI-DJ advance error:', e)
+    } finally {
+      this.advancing = false
+    }
   }
 
   private async revealRatings(): Promise<void> {
@@ -241,8 +255,7 @@ export class TripRoom implements DurableObject {
     const track = await this.deps.fetchCurrentlyPlaying(token)
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
     if (!currentSong || !track || track.id === currentSong.spotifyTrackId) return
-    await this.revealRatings()
-    await this.advanceToNextSong()
+    await this.advanceNow()
   }
 
   // Plays the next queued track on the DJ's device and opens its rating window.
