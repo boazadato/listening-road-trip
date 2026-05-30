@@ -192,7 +192,7 @@ The plan is split into one file per task under [`2026-05-29-listening-road-trip/
 - ✅ **Task 12** — [Current Song Tab](2026-05-29-listening-road-trip/task-12-current-song-tab.md) — `feat: CurrentSong tab — song card, emoji rating, countdown, reveal`
 - ✅ **Task 13** — [Leaderboard Tab](2026-05-29-listening-road-trip/task-13-leaderboard-tab.md) — `feat: Leaderboard tab with hall of shame styling`
 - ✅ **Task 14** — [Analysis Tab](2026-05-29-listening-road-trip/task-14-analysis-tab.md) — `feat: Analysis tab — group taste summary and Claude personality cards`
-- ⬜ **Task 15** — [API Integration & Frontend Behavior Tests](2026-05-29-listening-road-trip/task-15-api-integration-frontend-tests.md) — `test: API integration (SELF) + frontend behavior tests`
+- ✅ **Task 15** — [API Integration & Frontend Behavior Tests](2026-05-29-listening-road-trip/task-15-api-integration-frontend-tests.md) — `test: API integration (SELF) + frontend behavior tests`
 - ⬜ **Task 16** — [Build & Playwright E2E (Golden Path)](2026-05-29-listening-road-trip/task-16-build-playwright-e2e.md) — `chore: E2E golden path verified via Playwright MCP`
 - ⬜ **Task 17** — [Spotify App Setup & Deploy to Cloudflare](2026-05-29-listening-road-trip/task-17-spotify-app-setup-deploy.md) — `chore: production deploy — D1 id, Spotify OAuth app, secrets, verified`
 
