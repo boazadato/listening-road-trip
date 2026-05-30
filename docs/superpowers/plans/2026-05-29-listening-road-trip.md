@@ -189,7 +189,7 @@ The plan is split into one file per task under [`2026-05-29-listening-road-trip/
 - ✅ **Task 9** — [WebSocket Hook](2026-05-29-listening-road-trip/task-09-websocket-hook.md) — `feat: WebSocket hook with reactive connection state and auto-reconnect`
 - ✅ **Task 10** — [Home Page — Create & Join Forms](2026-05-29-listening-road-trip/task-10-home-page-create-join-forms.md) — `feat: Home page — create form with seed flavours (→ Spotify OAuth) and join form`
 - ✅ **Task 11** — [Trip Page — Layout, Tabs, WebSocket & DJ Connect](2026-05-29-listening-road-trip/task-11-trip-page-layout-tabs-ws-dj-connect.md) — `feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt`
-- ⬜ **Task 12** — [Current Song Tab](2026-05-29-listening-road-trip/task-12-current-song-tab.md) — `feat: CurrentSong tab — song card, emoji rating, countdown, reveal`
+- ✅ **Task 12** — [Current Song Tab](2026-05-29-listening-road-trip/task-12-current-song-tab.md) — `feat: CurrentSong tab — song card, emoji rating, countdown, reveal`
 - ⬜ **Task 13** — [Leaderboard Tab](2026-05-29-listening-road-trip/task-13-leaderboard-tab.md) — `feat: Leaderboard tab with hall of shame styling`
 - ⬜ **Task 14** — [Analysis Tab](2026-05-29-listening-road-trip/task-14-analysis-tab.md) — `feat: Analysis tab — group taste summary and Claude personality cards`
 - ⬜ **Task 15** — [API Integration & Frontend Behavior Tests](2026-05-29-listening-road-trip/task-15-api-integration-frontend-tests.md) — `test: API integration (SELF) + frontend behavior tests`
