@@ -34,7 +34,10 @@ async function callClaude(prompt: string, apiKey: string, maxTokens: number): Pr
       messages: [{ role: 'user', content: prompt }],
     }),
   })
-  if (!res.ok) throw new Error(`Claude API error: ${res.status}`)
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(`Claude API error: ${res.status} — ${body}`)
+  }
   const data = await res.json<{ content: Array<{ text: string }> }>()
   return data.content[0]?.text ?? ''
 }
@@ -67,8 +70,10 @@ export async function generateGroupTaste(
   songs: { title: string; artist: string; averageScore: number }[],
   apiKey: string
 ): Promise<GroupTasteResult> {
-  const topSongs = [...songs].sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
-  const bottomSongs = [...songs].sort((a, b) => a.averageScore - b.averageScore).slice(0, 3)
+  const sorted = [...songs].sort((a, b) => b.averageScore - a.averageScore)
+  const topSongs = sorted.slice(0, 5)
+  const topTitles = new Set(topSongs.map(s => s.title))
+  const bottomSongs = sorted.filter(s => !topTitles.has(s.title)).slice(-3)
 
   const prompt = `You are summarizing a road trip group's music taste based on their ratings.
 
@@ -113,8 +118,8 @@ export async function generateSongBatch(
   apiKey: string,
   count = 5
 ): Promise<SongPick[]> {
-  const liked = [...history].sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
-  const disliked = [...history].sort((a, b) => a.averageScore - b.averageScore).slice(0, 5)
+  const liked = [...history].filter(s => s.averageScore >= 3.5).sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
+  const disliked = [...history].filter(s => s.averageScore < 3).sort((a, b) => a.averageScore - b.averageScore).slice(0, 5)
 
   const prompt = `You are the AI DJ for a road trip music rating game. Pick the next ${count} songs to play.
 
