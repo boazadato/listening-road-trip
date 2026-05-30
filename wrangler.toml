@@ -20,7 +20,7 @@ new_sqlite_classes = ["TripRoom"]
 [[d1_databases]]
 binding = "DB"
 database_name = "listening-road-trip"
-database_id = "placeholder-local-dev"   # replace with real id at deploy (Task 17)
+database_id = "d615a3b0-8740-4423-b7fd-071dc1d72221"
 
 [vars]
 ENVIRONMENT = "development"
