@@ -1,0 +1,31 @@
+name = "listening-road-trip"
+main = "worker/src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./frontend-dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/ws"]
+
+[[durable_objects.bindings]]
+name = "TRIP_ROOM"
+class_name = "TripRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TripRoom"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "listening-road-trip"
+database_id = "placeholder-local-dev"   # replace with real id at deploy (Task 17)
+
+[vars]
+ENVIRONMENT = "development"
+
+# Secrets (set via `wrangler secret put` at deploy — Task 17):
+# SPOTIFY_CLIENT_ID
+# SPOTIFY_CLIENT_SECRET
+# CLAUDE_API_KEY
