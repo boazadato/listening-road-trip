@@ -34,6 +34,14 @@ A second review found deploy-blockers and bugs that an agent would hit executing
 
 Design tensions surfaced and **resolved to defaults** (see "Resolved Design Decisions" near the end): rating-window vs. song length (keep loose), analysis cache strategy (regenerate every +5 songs — implemented), and DJ identification/OAuth auth (name-match accepted for hobby use, revisit before public).
 
+### Revision Note 3 (2026-05-30, third critique pass)
+
+Scoped revision for a **friends-only, handful-of-trips** deployment (the Spotify ≤5-DJ dev-mode cap and name-match auth are accepted at this scale and remain documented as the public-launch blocker). Two changes:
+
+1. **Rating window now tracks real playback** (Tasks 4, 6, 12) — reverses Resolved Design Decision #1. The old fixed 2-minute wall-clock window left `pollSpotify()` doing `if (windowOpen) return`, so the DJ's music kept advancing while a window stayed open: people rated a song that was no longer playing and every intermediate song was silently dropped. The window now (a) is sized to the song's **remaining play time** (`duration_ms − progress_ms`, newly parsed from Spotify), clamped to `[20s, 5min]`, so the countdown genuinely tracks the song ending; and (b) **closes early when the DJ skips to a different track** (the alarm now polls every 5s *even while a window is open*), then opens the next song's window. A 20s min-floor doubles as anti-flicker for rapid skips. Ratings now always match what is actually playing, and no songs are dropped.
+
+2. **Dependency/compat freshness** (Task 1) — bumped `compatibility_date` `2025-01-01` → `2026-05-01`, and the **test toolchain** to current: `@cloudflare/vitest-pool-workers ^0.16.3` + `vitest ^4.1.0` (both packages). These were the only hard-locked-stale pins — a caret on `0.6.0` cannot reach the current `0.16.x`, and `0.16.x` requires vitest 4. All other carets (`wrangler ^4`, `@cloudflare/workers-types ^4.x`) already resolve to current. The frontend framework majors (vite 5, react-router-dom 6, zustand 4, react 18) are left as-is deliberately — they install cleanly and the inline code targets them; jumping majors is unjustified migration risk at this scale.
+
 ---
 
 ## Agent Session Protocol
@@ -201,11 +209,11 @@ We use the Claude and Spotify APIs via raw `fetch` — no SDK dependency.
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.6.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.3",
     "@cloudflare/workers-types": "^4.20250101.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "wrangler": "^4.0.0"
+    "vitest": "^4.1.0",
+    "wrangler": "^4.95.0"
   }
 }
 ```
@@ -328,7 +336,7 @@ CLAUDE_API_KEY=your_local_claude_key
     "jsdom": "^25.0.0",
     "typescript": "^5.6.0",
     "vite": "^5.4.0",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.0"
   }
 }
 ```
@@ -423,7 +431,7 @@ Three settings here are load-bearing and were wrong/missing in the prior draft (
 # wrangler.toml
 name = "listening-road-trip"
 main = "worker/src/index.ts"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 [assets]
@@ -528,6 +536,7 @@ export interface SpotifyTrack {
   artist: string
   album_art: string | null
   duration_ms: number
+  progress_ms: number   // playback position when polled — used to size the rating window to remaining song time
 }
 
 // WebSocket message types — server → client
@@ -948,7 +957,7 @@ ls worker/src/utils.ts worker/src/db.ts worker/test/utils.test.ts
 >
 > | State | HTTP | `is_playing` | `currently_playing_type` | `item` | parser result |
 > |---|---|---|---|---|---|
-> | Playing a track | 200 | `true` | `track` | full track object | the track (id, name, `artists[].name`, `album.images[0].url`, `duration_ms` all present) |
+> | Playing a track | 200 | `true` | `track` | full track object | the track (id, name, `artists[].name`, `album.images[0].url`, `duration_ms` present; `progress_ms` is on the **response root**, not `item`) |
 > | Paused | 200 | `false` | `track` | full track object | `null` (gated on `is_playing`) |
 > | Podcast episode | 200 | `true` | `episode` | **`null`** | `null` (gated on `!item`) |
 > | Nothing playing | 204 | — | — | — | `null` (gated on 204 in `fetchCurrentlyPlaying`) |
@@ -1021,9 +1030,10 @@ describe('parseCurrentlyPlaying', () => {
     expect(parseCurrentlyPlaying({ is_playing: false, item: { type: 'track', id: 't1', name: 'x' } })).toBeNull()
   })
 
-  it('extracts track info from Spotify response', () => {
+  it('extracts track info including progress_ms from the response root', () => {
     const response = {
       is_playing: true,
+      progress_ms: 120000,   // on the response root, NOT inside item
       item: {
         type: 'track',
         id: 'track_123',
@@ -1039,7 +1049,16 @@ describe('parseCurrentlyPlaying', () => {
       artist: 'Queen',
       album_art: 'https://img.spotify.com/art.jpg',
       duration_ms: 354000,
+      progress_ms: 120000,
     })
+  })
+
+  it('defaults progress_ms to 0 when absent', () => {
+    const response = {
+      is_playing: true,
+      item: { type: 'track', id: 't1', name: 'X', artists: [], album: {}, duration_ms: 1000 },
+    }
+    expect(parseCurrentlyPlaying(response)?.progress_ms).toBe(0)
   })
 })
 ```
@@ -1117,6 +1136,7 @@ export function parseCurrentlyPlaying(response: unknown): SpotifyTrack | null {
     artist: artists.map(a => a.name).join(', '),
     album_art: images[0]?.url ?? null,
     duration_ms: (item.duration_ms as number) ?? 0,
+    progress_ms: (r.progress_ms as number) ?? 0,   // playback position is on the response root, not item
   }
 }
 
@@ -1270,8 +1290,8 @@ ls worker/src/claude.ts worker/src/spotify.ts worker/src/db.ts worker/src/utils.
 
 The Durable Object is the heart of the app. It:
 1. Holds WebSocket connections for all participants
-2. Runs Spotify polling via alarms every 5 seconds, using the **trip's own** refresh token read from D1
-3. Manages rating windows (opens on new song, closes at 2 min, broadcasts reveal)
+2. Runs Spotify polling via alarms every 5 seconds, using the **trip's own** refresh token read from D1 — and now polls **even while a rating window is open**, so it can close the window the moment the DJ skips
+3. Manages rating windows (opens on new song, window sized to the song's remaining play time, closes early when the DJ changes tracks, broadcasts reveal)
 4. **Writes songs and ratings directly to D1** via `this.env.DB` — no Worker bridge
 5. Persists its live state (current song, window end time, ratings received) in DO storage
 
@@ -1282,10 +1302,12 @@ The Durable Object is the heart of the app. It:
 import { refreshAccessToken, fetchCurrentlyPlaying } from './spotify'
 import { createSong, upsertRating, getTripById } from './db'
 import { generateId } from './utils'
-import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState } from './types'
+import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState, SpotifyTrack } from './types'
 
-const RATING_WINDOW_MS = 2 * 60 * 1000  // 2 minutes
-const POLL_INTERVAL_MS = 5 * 1000        // 5 seconds
+const MIN_FLOOR_MS = 20 * 1000        // min rating time per song; doubles as anti-flicker for rapid skips
+const MAX_CAP_MS = 5 * 60 * 1000      // safety cap so a song left playing/paused forever still reveals
+const FALLBACK_WINDOW_MS = 90 * 1000  // used when Spotify omits duration/progress
+const POLL_INTERVAL_MS = 5 * 1000     // 5 seconds
 const EMOJI_SCORES: Record<string, number> = {
   '🔥': 5, '❤️': 4, '😐': 3, '😬': 2, '💀': 1,
 }
@@ -1458,24 +1480,45 @@ export class TripRoom implements DurableObject {
     await this.ctx.storage.delete('windowEndsAt')
   }
 
+  // Polled every 5s by alarm(), INCLUDING while a window is open, so a DJ skip
+  // closes the current window early instead of leaving raters stuck on a song
+  // that is no longer playing. Reconciles the stored currentSong against what
+  // Spotify is actually playing:
+  //   - no track playing (paused/nothing/podcast) → leave any open window be (the
+  //     cap reveal in alarm() still fires). Matches the validated spike: pause keeps
+  //     currentSong, resume doesn't re-broadcast.
+  //   - same track as currentSong → nothing to do; people are rating.
+  //   - different track, min-floor elapsed → reveal current, open a window for the new one.
+  //   - different track, within min-floor → ignore (anti-flicker for rapid skips).
   private async pollSpotify(): Promise<void> {
     const token = await this.getAccessToken()
     if (!token) return
 
     const track = await fetchCurrentlyPlaying(token)
-    if (!track) return
+    if (!track) return  // paused / nothing / non-track — don't disturb an open window
 
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
-    const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-    const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
+    if (currentSong?.spotifyTrackId === track.id) return  // same song still playing
 
-    if (windowOpen) return                                  // window still open — nothing to do
-    if (currentSong?.spotifyTrackId === track.id) return    // same track, window closed — wait for a change
+    // Different track (or the very first song). Respect the min-floor so a burst
+    // of skips doesn't spam reveals and every song gets a minimum rating window.
+    const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+    const windowStartedAt = await this.ctx.storage.get<number>('windowStartedAt')
+    const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
+    if (windowOpen && windowStartedAt && Date.now() - windowStartedAt < MIN_FLOOR_MS) return
+
+    // DJ moved on — close the current window early before opening the next.
+    if (windowOpen) await this.revealRatings()
 
     const tripId = await this.ctx.storage.get<string>('tripId')
     if (!tripId) return
 
-    // New song — persist to D1, open a window, broadcast
+    await this.startWindow(tripId, track)
+  }
+
+  private async startWindow(tripId: string, track: SpotifyTrack): Promise<void> {
+    // Persist the song to D1 (source of truth), then open a window sized to the
+    // song's REMAINING play time so the countdown tracks the song ending.
     const song = await createSong(this.env.DB, {
       id: generateId(),
       trip_id: tripId,
@@ -1492,8 +1535,14 @@ export class TripRoom implements DurableObject {
       artist: track.artist,
       albumArt: track.album_art,
     }
-    const windowEnd = Date.now() + RATING_WINDOW_MS
+
+    const remaining = track.duration_ms > 0 ? track.duration_ms - track.progress_ms : FALLBACK_WINDOW_MS
+    const windowMs = Math.min(MAX_CAP_MS, Math.max(MIN_FLOOR_MS, remaining || FALLBACK_WINDOW_MS))
+    const now = Date.now()
+    const windowEnd = now + windowMs
+
     await this.ctx.storage.put('currentSong', newSong)
+    await this.ctx.storage.put('windowStartedAt', now)
     await this.ctx.storage.put('windowEndsAt', windowEnd)
     await this.ctx.storage.delete(`ratings:${song.id}`)
 
@@ -2688,7 +2737,7 @@ export default function RatingButtons({ selected, disabled, onSelect }: Props) {
 
 ```tsx
 // frontend/src/components/CountdownTimer.tsx
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 interface Props {
   endsAt: number
@@ -2697,19 +2746,25 @@ interface Props {
 
 export default function CountdownTimer({ endsAt, onExpire }: Props) {
   const [remaining, setRemaining] = useState(() => Math.max(0, endsAt - Date.now()))
+  // Capture this window's length so the progress bar scales to it. Windows are now
+  // variable-length (sized to the song's remaining play time), not a fixed 2 min.
+  // Reset whenever endsAt changes (a new song reuses this component instance).
+  const totalRef = useRef(Math.max(1, endsAt - Date.now()))
 
   useEffect(() => {
+    totalRef.current = Math.max(1, endsAt - Date.now())
     const tick = () => {
       const r = Math.max(0, endsAt - Date.now())
       setRemaining(r)
       if (r === 0) onExpire?.()
     }
+    tick()
     const id = setInterval(tick, 250)
     return () => clearInterval(id)
   }, [endsAt, onExpire])
 
   const seconds = Math.ceil(remaining / 1000)
-  const pct = Math.max(0, remaining / (2 * 60 * 1000))
+  const pct = Math.min(1, Math.max(0, remaining / totalRef.current))
   const isUrgent = seconds <= 15
 
   return (
@@ -3342,7 +3397,7 @@ git commit -m "chore: production deploy — D1 id, Spotify OAuth app, secrets, v
 
 These product/architecture choices were surfaced by the critique and **resolved to their documented defaults on 2026-05-29**. They are **not** bugs — each was a deliberate call. Listed here so the rationale is recorded and not re-litigated mid-build.
 
-1. **Rating window (2 min) vs. song length / skips** (Task 6) — **RESOLVED: (a) keep the loose party-game behavior.** `pollSpotify()` does `if (windowOpen) return`, so a track change is ignored while a rating window is open; songs shorter than 2 minutes or rapid skips get dropped or misaligned. Accepted: this is a party game, not a precise rating instrument, and the simplicity (time-based window, no playback coupling) is worth more than exact song alignment. Revisit only if users complain about missed/misaligned songs. (Rejected: (b) dynamic window sized to `duration_ms`, (c) close window early on track change.)
+1. **Rating window vs. song length / skips** (Tasks 4, 6, 12) — **RESOLVED (revised 2026-05-30): (b)+(c) — the window tracks real playback.** *This reverses the earlier "keep it loose" call.* The fixed 2-min wall-clock window desynced ratings from playback: the DJ's music kept advancing while a window stayed open, so people rated a song that was no longer playing and intermediate songs were silently dropped. The window is now sized to the song's remaining play time (`duration_ms − progress_ms`, clamped to `[20s, 5min]`) **and** closes early when the DJ skips to a different track — the alarm now polls Spotify every 5s *even while a window is open*. A 20s min-floor guarantees rating time per song and prevents reveal-spam on rapid skips. (Rejected: (a) the original loose fixed-window behavior — the song/rating desync was too central to a *song*-rating game to accept.) Residual edge cases, accepted: a burst of skips within the 20s floor can still skip a song, and a song first detected with <20s left is floored to 20s of rating time after it has technically ended.
 
 2. **Analysis cache strategy** (analysis route) — **RESOLVED: (b) regenerate only when the count crosses a +5 bucket.** The original count-exact key thrashed the cache mid-trip, re-billing ≈11 Claude calls on every newly rated song. Now keyed on `Math.floor(ratedSongsCount / 5)`, so analysis refreshes at 10, 15, 20, … rated songs and serves cached in between. **Implemented** in the analysis route (Task 7). (Rejected: (a) time TTL — count-bucket is simpler and deterministic; (c) accept thrashing — too slow/costly exactly when the tab is used.)
 
@@ -3360,7 +3415,7 @@ These product/architecture choices were surfaced by the critique and **resolved 
 - ✅ Join by name only; shareable URL + QR code + short code
 - ✅ Spotify polling via Durable Object alarm, using the trip's own token
 - ✅ Auto song persistence + broadcast on song change (DO writes D1 directly)
-- ✅ 2-minute rating window with countdown
+- ✅ Rating window tracks the song's remaining play time (countdown), closes early on DJ skip
 - ✅ 5 emoji ratings (🔥❤️😐😬💀) mapped to 1-5, persisted to D1
 - ✅ Rating changes within window; X/N counter live; choices hidden until reveal
 - ✅ Big reveal at window close
@@ -3384,3 +3439,5 @@ These product/architecture choices were surfaced by the critique and **resolved 
 - DJ is creator-only; no hand-off to another participant
 - `totalCount` counts live WebSocket connections, so a backgrounded tab can drop the denominator briefly
 - A track replayed immediately after itself won't re-trigger until a different track plays in between
+- A burst of skips within the 20s min-floor can still skip a song; a song detected with <20s of play left is floored to 20s of rating time
+- Spotify dev-mode cap (≤5 DJ accounts, Premium required) — the documented blocker to any public launch; fine at friends-only scale
