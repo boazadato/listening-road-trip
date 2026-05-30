@@ -79,7 +79,13 @@ export class TripRoom implements DurableObject {
       const current = await this.ctx.storage.get<SongInfo>('currentSong')
       const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
       const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
-      if ((!current || !windowOpen) && !this.advancing) await this.advanceToNextSong()
+      if ((!current || !windowOpen) && !this.advancing) {
+        try {
+          await this.advanceToNextSong()
+        } catch (e) {
+          console.error('start-djing: advanceToNextSong threw:', e)
+        }
+      }
       return new Response('OK')
     }
 
@@ -263,15 +269,16 @@ export class TripRoom implements DurableObject {
   // Plays the next queued track on the DJ's device and opens its rating window.
   // Generates + resolves a fresh batch first if the queue is empty.
   private async advanceToNextSong(): Promise<void> {
+    console.log('advanceToNextSong: entered')
     const tripId = await this.ctx.storage.get<string>('tripId')
-    if (!tripId) return
+    if (!tripId) { console.error('advanceToNextSong: no tripId in storage'); return }
     const token = await this.getAccessToken()
-    if (!token) return  // DJ hasn't connected Spotify yet — nothing to play
+    if (!token) { console.error('advanceToNextSong: getAccessToken returned null — token refresh may have failed'); return }
 
     let queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
     if (queue.length === 0) {
       queue = await this.generateAndEnqueueBatch(tripId, token)
-      if (queue.length === 0) return  // nothing resolved this round — retry next alarm
+      if (queue.length === 0) { console.error('advanceToNextSong: queue still empty after batch generation — all picks unresolvable or Claude returned none'); return }
     }
 
     const track = queue.shift()!
@@ -350,13 +357,26 @@ export class TripRoom implements DurableObject {
       const djTaste = await this.getDjTasteSeed(tripId, token)        // DJ's own Spotify favorites (language/style signal)
       const history = await getRatingSummary(this.env.DB, tripId)   // rated songs + avg score (adaptation)
       const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
-      const picks = await this.deps.generateSongBatch(seed, history, played, djTaste, this.env.CLAUDE_API_KEY, BATCH_SIZE)
+      let picks
+      try {
+        picks = await this.deps.generateSongBatch(seed, history, played, djTaste, this.env.CLAUDE_API_KEY, BATCH_SIZE)
+      } catch (e) {
+        console.error('generateAndEnqueueBatch: generateSongBatch threw:', e)
+        throw e
+      }
+      console.log(`generateAndEnqueueBatch: Claude returned ${picks.length} picks`)
 
       const resolved: SpotifyTrack[] = []
       for (const pick of picks) {
-        const track = await this.deps.searchTrack(token, pick.title, pick.artist)
-        if (track) resolved.push({ ...track, reason: pick.reason })
+        try {
+          const track = await this.deps.searchTrack(token, pick.title, pick.artist)
+          if (track) resolved.push({ ...track, reason: pick.reason })
+          else console.log(`generateAndEnqueueBatch: Spotify search returned null for "${pick.title}" by ${pick.artist}`)
+        } catch (e) {
+          console.error(`generateAndEnqueueBatch: searchTrack threw for "${pick.title}" by ${pick.artist}:`, e)
+        }
       }
+      console.log(`generateAndEnqueueBatch: ${resolved.length}/${picks.length} picks resolved`)
       const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
       const merged = [...queue, ...resolved]
       await this.ctx.storage.put('queue', merged)
@@ -412,7 +432,7 @@ export class TripRoom implements DurableObject {
     const tripId = await this.ctx.storage.get<string>('tripId')
     if (!tripId) return null
     const trip = await getTripById(this.env.DB, tripId)
-    if (!trip?.spotify_refresh_token) return null
+    if (!trip?.spotify_refresh_token) { console.error('getAccessToken: no spotify_refresh_token in D1 for trip', tripId); return null }
     try {
       this.accessToken = await this.deps.refreshAccessToken(
         this.env.SPOTIFY_CLIENT_ID,
@@ -421,7 +441,8 @@ export class TripRoom implements DurableObject {
       )
       this.tokenExpiresAt = Date.now() + 3_600_000
       return this.accessToken
-    } catch {
+    } catch (e) {
+      console.error('getAccessToken: Spotify token refresh threw:', e)
       return null
     }
   }
