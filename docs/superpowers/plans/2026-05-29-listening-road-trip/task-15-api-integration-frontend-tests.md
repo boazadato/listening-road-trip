@@ -183,6 +183,8 @@ cd ../worker && pnpm typecheck
 
 Expected: all PASS, no type errors.
 
+> **Heads-up (vitest 4 / vite 5 peer mismatch).** `pnpm install` warns that `vitest@4.1.x` wants `vite ^6 || ^7 || ^8` but the frontend pins `vite@5.4.x` (deliberate — Revision Note 3 kept the frontend majors as-is and bumped only the test toolchain). The warning is benign for the backend (vitest-pool-workers brings its own vite) and install succeeds. **If the frontend vitest suite above fails to load/run** (jsdom env not applying, `globals` undefined, or a vite/vitest version-incompat error rather than an assertion failure), this peer mismatch is the first suspect — resolve by bumping `frontend` to `vite ^6` (and `@vitejs/plugin-react` to match) **or** pinning frontend `vitest` back to `^3`. Don't touch this unless the suite actually breaks on it.
+
 - [ ] **Step 5: Commit**
 
 ```bash
