@@ -28,7 +28,7 @@ export default function Home() {
 
   return (
     <div className="page" style={{ paddingTop: 60 }}>
-      <h1 style={{ fontSize: 28, marginBottom: 8 }}>🚗 Listening Road Trip</h1>
+      <h1 style={{ fontSize: 28, marginBottom: 8 }}>Maya's roadtrip DJ 🎶</h1>
       <p style={{ color: 'var(--text-dim)', marginBottom: 32 }}>Rate songs with your crew</p>
 
       {mode === 'choose' && (
