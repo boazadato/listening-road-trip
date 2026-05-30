@@ -12,6 +12,8 @@ Per CLAUDE.md, API-level integration tests (via the `SELF` binding) are the **pr
 
 **Files:**
 - Create: `worker/test/api.test.ts`
+- Create: `frontend/vitest.config.ts`
+- Create: `frontend/src/test/setup.ts`
 - Create: `frontend/src/components/__tests__/CountdownTimer.test.tsx`
 - Create: `frontend/src/hooks/__tests__/tripStore.test.ts`
 
@@ -132,7 +134,30 @@ cd worker && pnpm test
 
 Expected: utils, spotify, and api suites all PASS.
 
-- [ ] **Step 3: Write frontend behavior tests**
+- [ ] **Step 3: Create frontend test setup**
+
+The frontend tests need a vitest config for the jsdom environment (required for `render`) and a setup file for `@testing-library/jest-dom` matchers (required for `toBeInTheDocument()`).
+
+```typescript
+// frontend/vitest.config.ts
+import { defineConfig } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+  },
+})
+```
+
+```typescript
+// frontend/src/test/setup.ts
+import '@testing-library/jest-dom'
+```
+
+- [ ] **Step 4: Write frontend behavior tests**
 
 ```tsx
 // frontend/src/components/__tests__/CountdownTimer.test.tsx
@@ -174,7 +199,7 @@ it('reveal clears the window and stores results', () => {
 })
 ```
 
-- [ ] **Step 4: Run frontend tests + type-check both packages**
+- [ ] **Step 5: Run frontend tests + type-check both packages**
 
 ```bash
 cd frontend && pnpm test && pnpm typecheck
@@ -183,12 +208,12 @@ cd ../worker && pnpm typecheck
 
 Expected: all PASS, no type errors.
 
-> **Heads-up (vitest 4 / vite 5 peer mismatch).** `pnpm install` warns that `vitest@4.1.x` wants `vite ^6 || ^7 || ^8` but the frontend pins `vite@5.4.x` (deliberate — Revision Note 3 kept the frontend majors as-is and bumped only the test toolchain). The warning is benign for the backend (vitest-pool-workers brings its own vite) and install succeeds. **If the frontend vitest suite above fails to load/run** (jsdom env not applying, `globals` undefined, or a vite/vitest version-incompat error rather than an assertion failure), this peer mismatch is the first suspect — resolve by bumping `frontend` to `vite ^6` (and `@vitejs/plugin-react` to match) **or** pinning frontend `vitest` back to `^3`. Don't touch this unless the suite actually breaks on it.
+> **Heads-up (vitest 4 / vite 5 peer mismatch).** `pnpm install` warns that `vitest@4.1.x` wants `vite ^6 || ^7 || ^8` but the frontend pins `vite@5.4.x` (deliberate — Revision Note 3 kept the frontend majors as-is and bumped only the test toolchain). The warning is benign for the backend (vitest-pool-workers brings its own vite) and install succeeds. **If the frontend vitest suite above fails to load/run** (jsdom env not applying, `globals` undefined, or a vite/vitest version-incompat error rather than an assertion failure), this peer mismatch is the first suspect. **Preferred fix: pin `frontend` vitest back to `^3`** (change `"vitest": "^4.1.0"` → `"vitest": "^3.2.0"` in `frontend/package.json`, then `pnpm install`). Do NOT bump frontend to `vite ^6` — `@vitejs/plugin-react@4.x` has peer `vite >=4 <6`, so that would also require bumping plugin-react to v5, creating unnecessary churn. Don't touch this unless the suite actually breaks on it.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add worker/test/api.test.ts frontend/src/components/__tests__ frontend/src/hooks/__tests__
+git add worker/test/api.test.ts frontend/vitest.config.ts frontend/src/test/setup.ts frontend/src/components/__tests__ frontend/src/hooks/__tests__
 git commit -m "test: API integration (SELF) + frontend behavior tests" && git push
 ```
 
