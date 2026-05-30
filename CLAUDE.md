@@ -21,6 +21,8 @@ Real-time road trip music rating app with an **AI DJ**. The trip creator seeds t
 
 ## Local Dev Setup
 
+Requires **Node 22** (pinned in `.node-version` / `.nvmrc`; enforced via `engines` in the root `package.json`). With `nvm`/`fnm`/`asdf`, run `nvm use` (or let it auto-switch) before installing. pnpm is provisioned via Corepack (`packageManager: pnpm@9`).
+
 ```bash
 # First-time only: install pre-commit hook
 make setup

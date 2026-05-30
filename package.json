@@ -1,5 +1,8 @@
 {
   "name": "listening-road-trip",
   "private": true,
-  "packageManager": "pnpm@9.0.0"
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=22"
+  }
 }
