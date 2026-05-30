@@ -5,3 +5,5 @@ dist/
 .dev.vars
 *.log
 .DS_Store
+.playwright-mcp/
+e2e-*.png
