@@ -18,6 +18,8 @@ The Durable Object is the heart of the app — now the **AI DJ orchestrator**. I
 5. **Writes songs and ratings directly to D1** via `this.env.DB` — no Worker bridge
 6. Persists its live state (queue, current song, window end time, ratings, play order) in DO storage; the alarm still **stops when no sockets are connected** and resumes on reconnect
 
+**Testability:** the DO reaches its Spotify + Claude calls through one assignable `deps` field (`TripRoomDeps`) that defaults to the real imports. The orchestration tests in Step 2 swap in fakes that return plain domain objects, so the state machine (advance → persist → reveal, the no-device requeue, rating gating) is exercised with **zero network** but against the **real test D1**. This is the automated cover for the DO loop that the plan otherwise left to the optional, credential-gated Playwright run.
+
 - [ ] **Step 1: Implement TripRoom Durable Object**
 
 ```typescript
@@ -27,6 +29,20 @@ import { createSong, upsertRating, getTripById, getRatingSummary, setTripDjTaste
 import { generateSongBatch } from './claude'
 import { generateId } from './utils'
 import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState, SpotifyTrack, SeedPrefs, DjTasteTrack } from './types'
+
+// The DO's network collaborators (Spotify + Claude), grouped behind one assignable
+// field so the orchestration tests can swap in fakes that return plain domain objects
+// (no HTTP). D1 helpers are intentionally NOT here — tests run against the real test D1,
+// which is what catches persistence regressions like the original silently-dropped songs.
+export interface TripRoomDeps {
+  refreshAccessToken: typeof refreshAccessToken
+  fetchCurrentlyPlaying: typeof fetchCurrentlyPlaying
+  searchTrack: typeof searchTrack
+  startPlayback: typeof startPlayback
+  fetchDjTasteSeed: typeof fetchDjTasteSeed
+  generateSongBatch: typeof generateSongBatch
+}
+const DEFAULT_DEPS: TripRoomDeps = { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, fetchDjTasteSeed, generateSongBatch }
 
 const MIN_FLOOR_MS = 20 * 1000        // floor a window so very short tracks still get rating time
 const MAX_CAP_MS = 6 * 60 * 1000      // safety cap so a stuck/paused song still reveals
@@ -56,6 +72,7 @@ export class TripRoom implements DurableObject {
   private tokenExpiresAt = 0
   private generating = false   // guards against overlapping batch generations (prefetch + on-demand)
   private djTaste: DjTasteTrack[] | null = null   // DJ's own Spotify favorites, fetched once at ride start (null = not yet loaded)
+  deps: TripRoomDeps = DEFAULT_DEPS   // network collaborators; tests reassign via runInDurableObject (see Step 2)
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -227,7 +244,7 @@ export class TripRoom implements DurableObject {
   private async reconcilePlayback(): Promise<void> {
     const token = await this.getAccessToken()
     if (!token) return
-    const track = await fetchCurrentlyPlaying(token)
+    const track = await this.deps.fetchCurrentlyPlaying(token)
     const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
     if (!currentSong || !track || track.id === currentSong.spotifyTrackId) return
     await this.revealRatings()
@@ -254,7 +271,7 @@ export class TripRoom implements DurableObject {
     // Play it BEFORE opening the window so the countdown matches real audio.
     // No active device → put the track back and tell the creator to open Spotify.
     try {
-      await startPlayback(token, track.uri)
+      await this.deps.startPlayback(token, track.uri)
     } catch (e) {
       queue.unshift(track)
       await this.ctx.storage.put('queue', queue)
@@ -324,11 +341,11 @@ export class TripRoom implements DurableObject {
       const djTaste = await this.getDjTasteSeed(tripId, token)        // DJ's own Spotify favorites (language/style signal)
       const history = await getRatingSummary(this.env.DB, tripId)   // rated songs + avg score (adaptation)
       const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
-      const picks = await generateSongBatch(seed, history, played, djTaste, this.env.CLAUDE_API_KEY, BATCH_SIZE)
+      const picks = await this.deps.generateSongBatch(seed, history, played, djTaste, this.env.CLAUDE_API_KEY, BATCH_SIZE)
 
       const resolved: SpotifyTrack[] = []
       for (const pick of picks) {
-        const track = await searchTrack(token, pick.title, pick.artist)
+        const track = await this.deps.searchTrack(token, pick.title, pick.artist)
         if (track) resolved.push({ ...track, reason: pick.reason })
       }
       const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
@@ -371,7 +388,7 @@ export class TripRoom implements DurableObject {
       try { this.djTaste = JSON.parse(trip.dj_taste_seed) as DjTasteTrack[]; return this.djTaste } catch { /* fall through to refetch */ }
     }
     try {
-      const seed = await fetchDjTasteSeed(token)
+      const seed = await this.deps.fetchDjTasteSeed(token)
       this.djTaste = seed
       if (seed.length > 0) await setTripDjTasteSeed(this.env.DB, tripId, JSON.stringify(seed))
       return seed
@@ -388,7 +405,7 @@ export class TripRoom implements DurableObject {
     const trip = await getTripById(this.env.DB, tripId)
     if (!trip?.spotify_refresh_token) return null
     try {
-      this.accessToken = await refreshAccessToken(
+      this.accessToken = await this.deps.refreshAccessToken(
         this.env.SPOTIFY_CLIENT_ID,
         this.env.SPOTIFY_CLIENT_SECRET,
         trip.spotify_refresh_token
@@ -461,10 +478,184 @@ export class TripRoom implements DurableObject {
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 2: Deterministic orchestration tests**
+
+Create `worker/test/triproom.test.ts`. These four tests exercise the orchestration state machine with **fake `deps`** (zero network) against the **real test D1**, using the `cloudflare:test` DO helpers. They cover the failure modes this project actually hit or designed around: songs silently dropped (Revision Note 1), the no-device requeue, and rating-window gating (Revision Notes 3–4). Most call the DO methods directly via `runInDurableObject`; only the alarm-ordering test needs a live socket (to clear the alarm's "nobody connected" guard).
+
+```typescript
+// worker/test/triproom.test.ts
+import { env, runInDurableObject, runDurableObjectAlarm } from 'cloudflare:test'
+import { describe, it, expect, vi } from 'vitest'
+import { NoActiveDeviceError } from '../src/spotify'
+import type { TripRoomDeps } from '../src/TripRoom'
+import type { ServerMessage, SpotifyTrack } from '../src/types'
+
+// A resolved Spotify track the fakes hand back.
+function track(over: Partial<SpotifyTrack> = {}): SpotifyTrack {
+  return { id: 't1', uri: 'spotify:track:t1', title: 'Song', artist: 'Artist', album_art: 'art.jpg', duration_ms: 200_000, progress_ms: 0, reason: null, ...over }
+}
+
+// Happy-path network fakes; override per test.
+function fakeDeps(over: Partial<TripRoomDeps> = {}): TripRoomDeps {
+  return {
+    refreshAccessToken: vi.fn().mockResolvedValue('tok'),
+    fetchCurrentlyPlaying: vi.fn().mockResolvedValue(null),
+    searchTrack: vi.fn().mockResolvedValue(track()),
+    startPlayback: vi.fn().mockResolvedValue(undefined),
+    fetchDjTasteSeed: vi.fn().mockResolvedValue([]),
+    generateSongBatch: vi.fn().mockResolvedValue([{ title: 'Song', artist: 'Artist', reason: 'fits the vibe' }]),
+    ...over,
+  }
+}
+
+// Trip row (with a refresh token so getAccessToken resolves) + a stub for that trip's DO.
+async function setupRoom(tripId = 'trip-' + Math.random().toString(36).slice(2)) {
+  await env.DB.prepare(
+    'INSERT INTO trips (id, name, short_code, creator_name, spotify_refresh_token, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(tripId, 'Road Trip', 'ABC123', 'Boaz', 'refresh-tok', Date.now()).run()
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(tripId))
+  return { stub, tripId }
+}
+
+// Capture broadcasts without a socket: replace broadcastAll on the (singleton) instance.
+function spyBroadcasts(instance: any, sink: ServerMessage[]): void {
+  instance.broadcastAll = (m: ServerMessage) => { sink.push(m) }
+}
+
+describe('TripRoom AI-DJ orchestration', () => {
+  it('plays the next pick, persists it to D1, drops unresolvable picks, and sizes the window to the song', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps({
+      generateSongBatch: vi.fn().mockResolvedValue([
+        { title: 'A', artist: 'X', reason: 'r1' },
+        { title: 'B', artist: 'Y', reason: 'r2' },   // unresolvable below → dropped
+        { title: 'C', artist: 'Z', reason: 'r3' },
+      ]),
+      searchTrack: vi.fn()
+        .mockResolvedValueOnce(track({ id: 'a', uri: 'spotify:track:a', title: 'A', artist: 'X', duration_ms: 200_000 }))
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(track({ id: 'c', uri: 'spotify:track:c', title: 'C', artist: 'Z', duration_ms: 200_000 })),
+    })
+
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      spyBroadcasts(instance, sent)
+      await instance.advanceToNextSong()
+    })
+
+    expect(deps.startPlayback).toHaveBeenCalledWith('tok', 'spotify:track:a')
+
+    // Persisted to D1 — the bug the first draft shipped (songs silently dropped).
+    const songs = await env.DB.prepare('SELECT * FROM songs WHERE trip_id = ?').bind(tripId).all()
+    expect(songs.results).toHaveLength(1)
+    expect(songs.results[0]).toMatchObject({ title: 'A', spotify_uri: 'spotify:track:a', play_order: 0 })
+
+    // Unresolvable pick (B) dropped → only the third resolved track remains queued.
+    const queue = await runInDurableObject(stub, (_i: any, s) => s.storage.get<SpotifyTrack[]>('queue'))
+    expect(queue?.map(t => t.id)).toEqual(['c'])
+
+    const started = sent.find(m => m.type === 'song_started') as Extract<ServerMessage, { type: 'song_started' }>
+    expect(started).toBeTruthy()
+    const startedAt = await runInDurableObject(stub, (_i: any, s) => s.storage.get<number>('windowStartedAt'))
+    expect(started.windowEndsAt - startedAt!).toBe(200_000)   // within [20s, 6min] → full duration
+  })
+
+  it('requeues the track and broadcasts playback_error when no device is active', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps({ startPlayback: vi.fn().mockRejectedValue(new NoActiveDeviceError()) })
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      spyBroadcasts(instance, sent)
+      await instance.advanceToNextSong()
+    })
+
+    expect(sent.some(m => m.type === 'playback_error')).toBe(true)
+    const songs = await env.DB.prepare('SELECT * FROM songs WHERE trip_id = ?').bind(tripId).all()
+    expect(songs.results).toHaveLength(0)                                                  // nothing persisted
+    const queue = await runInDurableObject(stub, (_i: any, s) => s.storage.get<SpotifyTrack[]>('queue'))
+    expect(queue && queue.length).toBeGreaterThan(0)                                       // track put back
+    expect(await runInDurableObject(stub, (_i: any, s) => s.storage.get('djActive'))).toBe(false)
+    expect(await runInDurableObject(stub, (_i: any, s) => s.storage.get('currentSong'))).toBeUndefined()  // did not advance
+  })
+
+  it('records an in-window rating to D1 and rejects ratings after the window closes', async () => {
+    const { stub, tripId } = await setupRoom()
+    await env.DB.prepare('INSERT INTO participants (id, trip_id, name, joined_at) VALUES (?, ?, ?, ?)')
+      .bind('p1', tripId, 'Dana', Date.now()).run()
+
+    let songId = ''
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = fakeDeps()
+      await state.storage.put('tripId', tripId)
+      await instance.advanceToNextSong()                       // creates the song + opens the window
+      songId = (await state.storage.get<any>('currentSong')).id
+      spyBroadcasts(instance, sent)
+      await instance.handleRating('p1', 'Dana', { type: 'rate', songId, emoji: '🔥', score: 5 })
+    })
+
+    let ratings = await env.DB.prepare('SELECT * FROM ratings WHERE song_id = ?').bind(songId).all()
+    expect(ratings.results).toHaveLength(1)
+    expect(ratings.results[0]).toMatchObject({ participant_id: 'p1', emoji: '🔥', score: 5 })
+    expect(sent.find(m => m.type === 'rating_update')).toMatchObject({ ratedCount: 1 })
+
+    // Close the window and rate again → must be rejected (no new row, no broadcast).
+    const after: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = fakeDeps()
+      await state.storage.put('windowEndsAt', Date.now() - 1)
+      spyBroadcasts(instance, after)
+      await instance.handleRating('p1', 'Dana', { type: 'rate', songId, emoji: '💀', score: 1 })
+    })
+    ratings = await env.DB.prepare('SELECT * FROM ratings WHERE song_id = ?').bind(songId).all()
+    expect(ratings.results).toHaveLength(1)                     // unchanged
+    expect(after).toHaveLength(0)
+  })
+
+  it('alarm reveals the open song before advancing once the window has elapsed', async () => {
+    const { stub, tripId } = await setupRoom()
+
+    // One live socket so the alarm's "nobody connected" billing guard passes.
+    const res = await stub.fetch(`http://do/ws?participantId=p1&participantName=A&tripId=${tripId}`, {
+      headers: { Upgrade: 'websocket' },
+    })
+    res.webSocket?.accept()
+
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = fakeDeps()
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('currentSong', { id: 's1', spotifyTrackId: 't0', title: 'Old', artist: 'O', albumArt: null, reason: null })
+      await state.storage.put('windowEndsAt', Date.now() - 1)   // elapsed
+      spyBroadcasts(instance, sent)
+    })
+
+    await runDurableObjectAlarm(stub)
+
+    const types = sent.map(m => m.type)
+    expect(types).toContain('rating_reveal')
+    expect(types).toContain('song_started')
+    expect(types.indexOf('song_started')).toBeGreaterThan(types.indexOf('rating_reveal'))
+  })
+})
+```
+
+Run them:
+```bash
+cd worker && pnpm test
+```
+Expected: utils, spotify, and the new triproom suites all PASS.
+
+> If `runInDurableObject`/`runDurableObjectAlarm` aren't found, they're named exports of `cloudflare:test` (provided by `@cloudflare/vitest-pool-workers`); no extra config beyond the existing `vitest.config.ts` is needed. These tests assert against the real test D1 (schema applied by `test/apply-schema.ts`), so a `no such table` failure points at the setup file, not the test.
+
+- [ ] **Step 3: Commit**
 
 ```bash
-git add worker/src/TripRoom.ts
+git add worker/src/TripRoom.ts worker/test/triproom.test.ts
 git commit -m "feat: TripRoom DO — AI-DJ orchestration (batch/replan/playback), WS hub, direct D1 writes" && git push
 ```
 

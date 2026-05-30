@@ -8,7 +8,7 @@ ls worker/src/index.ts frontend/src/components/Analysis.tsx
 pnpm install
 ```
 
-Per CLAUDE.md, API-level integration tests (via the `SELF` binding) are the **primary** backend strategy. These would have caught the persistence bugs in the first draft. We add the cross-layer HTTP tests here plus two focused frontend behavior tests. (The AI-DJ orchestration path — Claude batch + Spotify search/playback — needs live credentials and is covered by the Playwright E2E in Task 16; the pure pieces `searchTrack`/`generateSongBatch` are unit-tested in Tasks 4–5.)
+Per CLAUDE.md, API-level integration tests (via the `SELF` binding) are the **primary** backend strategy. These would have caught the persistence bugs in the first draft. We add the cross-layer HTTP tests here plus two focused frontend behavior tests. (The AI-DJ orchestration *state machine* — advance → persist → reveal, the no-device requeue, and rating gating — is covered deterministically with fake `deps` against the real test D1 in **Task 6, Step 2** (`worker/test/triproom.test.ts`); the pure pieces `searchTrack`/`generateSongBatch` are unit-tested in Tasks 4–5. Only the *live* end-to-end run — real Spotify Premium device + Claude credentials — remains the optional, credential-gated Playwright check in Task 16.)
 
 **Files:**
 - Create: `worker/test/api.test.ts`
