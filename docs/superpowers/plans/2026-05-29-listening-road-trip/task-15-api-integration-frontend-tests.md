@@ -69,13 +69,13 @@ describe('trip lifecycle', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: 'AI Trip', creatorName: 'Boaz',
-        seedPrefs: { genres: ['Hip-Hop', 'Indie'], decades: ['90s'], energy: 4 },
+        seedPrefs: { genres: ['Hip-Hop', 'Indie'], decades: ['90s'], languages: ['Hebrew'], energy: 4 },
       }),
     })
     const { trip } = await create.json<{ trip: { short_code: string } }>()
     const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}`)
-    const data = await res.json<{ trip: { seedPrefs: { genres: string[]; decades: string[]; energy: number } } }>()
-    expect(data.trip.seedPrefs).toEqual({ genres: ['Hip-Hop', 'Indie'], decades: ['90s'], energy: 4 })
+    const data = await res.json<{ trip: { seedPrefs: { genres: string[]; decades: string[]; languages: string[]; energy: number } } }>()
+    expect(data.trip.seedPrefs).toEqual({ genres: ['Hip-Hop', 'Indie'], decades: ['90s'], languages: ['Hebrew'], energy: 4 })
   })
 
   it('joins idempotently — same name returns the same participant id', async () => {

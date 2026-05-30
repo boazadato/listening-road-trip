@@ -16,7 +16,7 @@ This module is now also the **AI DJ's brain**: `generateSongBatch` picks the nex
 
 ```typescript
 // worker/src/claude.ts
-import type { SeedPrefs } from './types'
+import type { SeedPrefs, DjTasteTrack } from './types'
 
 export interface PersonalityResult {
   label: string    // e.g. "The Reluctant Optimist"
@@ -115,12 +115,18 @@ export interface RatedSongSummary {
 }
 
 // The AI DJ. Picks the next batch from the seed flavours, leaning into what the
-// group has rated highly and away from what flopped. `history` is empty for the
-// first batch (pure seed). `alreadyPlayed` is the exclusion list so we never repeat.
+// group has rated highly and away from what flopped. Three distinct taste inputs:
+//   • `seed`       — the DJ's chosen genres/decades/languages/energy (works from batch 1)
+//   • `djTaste`    — a sample of the DJ's OWN Spotify favorites; surfaces their language /
+//                    regional style (e.g. Hebrew) from batch 1, before any ratings exist
+//   • `history`    — in-trip crowd favorites/flops (empty for the first batch)
+// `djTaste` AUGMENTS the seed/ratings — it never overrides what the crowd actually likes.
+// `alreadyPlayed` is the exclusion list so we never repeat.
 export async function generateSongBatch(
   seed: SeedPrefs,
   history: RatedSongSummary[],
   alreadyPlayed: { title: string; artist: string }[],
+  djTaste: DjTasteTrack[],
   apiKey: string,
   count = 5
 ): Promise<SongPick[]> {
@@ -132,15 +138,21 @@ export async function generateSongBatch(
 Seed taste (set by the trip's DJ):
 - Genres: ${seed.genres.join(', ') || 'any'}
 - Decades: ${seed.decades.join(', ') || 'any'}
+- Languages: ${seed.languages.join(', ') || 'any'}
 - Energy (1 chill … 5 high): ${seed.energy}
-
-${history.length === 0 ? 'This is the first batch — go off the seed taste.' : `Ratings so far (🔥=5 … 💀=1), use these to adapt:
+${djTaste.length > 0 ? `
+The DJ's own Spotify favorites (a sample of what THEY actually listen to — infer their language and regional/cultural style from this, especially non-English / local-language music like Hebrew, and let it shape your picks within the genres/decades above):
+${djTaste.map(t => `- "${t.title}" by ${t.artist}`).join('\n')}
+` : ''}
+${history.length === 0 ? 'This is the first batch — go off the seed taste and the DJ\'s own favorites above.' : `Ratings so far (🔥=5 … 💀=1), use these to adapt:
 Crowd favorites: ${liked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'}
 Flops to avoid leaning on: ${disliked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'}
 Lean toward the favorites' style; steer away from the flops while staying within the seed taste.`}
 
 Do NOT repeat any of these already-played songs:
 ${alreadyPlayed.map(s => `- "${s.title}" by ${s.artist}`).join('\n') || '- (none yet)'}
+
+When picking songs for a genre or decade, prefer the languages listed above and lean into the languages and regional styles evident in the DJ's own favorites and the crowd favorites — do NOT default to English if the DJ's taste is local-language (e.g. keep serving Hebrew songs to a Hebrew-listening DJ).
 
 Return real, well-known, findable songs (exact title + primary artist as they appear on Spotify). For each, add a short one-line reason.
 

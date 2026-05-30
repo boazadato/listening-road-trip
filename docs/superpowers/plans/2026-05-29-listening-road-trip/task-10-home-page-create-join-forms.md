@@ -150,7 +150,7 @@ export default function Home() {
 ```tsx
 // frontend/src/components/CreateTripForm.tsx
 import { useState } from 'react'
-import { GENRE_OPTIONS, DECADE_OPTIONS } from '../types'
+import { GENRE_OPTIONS, DECADE_OPTIONS, LANGUAGE_OPTIONS } from '../types'
 
 interface Props {
   onCreated: (participantId: string, participantName: string, tripCode: string, tripId: string) => void
@@ -188,6 +188,7 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
   const [yourName, setYourName] = useState('')
   const [genres, setGenres] = useState<string[]>([])
   const [decades, setDecades] = useState<string[]>([])
+  const [languages, setLanguages] = useState<string[]>([])
   const [energy, setEnergy] = useState(3)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -206,7 +207,7 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
         body: JSON.stringify({
           name: tripName.trim(),
           creatorName: yourName.trim(),
-          seedPrefs: { genres, decades, energy },
+          seedPrefs: { genres, decades, languages, energy },
         }),
       })
       const data = (await res.json()) as { trip: { id: string; short_code: string } }
@@ -243,6 +244,10 @@ export default function CreateTripForm({ onCreated, onBack }: Props) {
       <div>
         <div className="label">Decades</div>
         <ChipRow options={DECADE_OPTIONS} selected={decades} onToggle={v => toggle(decades, setDecades, v)} />
+      </div>
+      <div>
+        <div className="label">Languages (the AI DJ also reads your own Spotify favorites)</div>
+        <ChipRow options={LANGUAGE_OPTIONS} selected={languages} onToggle={v => toggle(languages, setLanguages, v)} />
       </div>
       <div>
         <div className="label">Energy: {['Chill', 'Mellow', 'Balanced', 'Upbeat', 'High'][energy - 1]}</div>

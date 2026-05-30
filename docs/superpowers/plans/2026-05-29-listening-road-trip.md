@@ -58,6 +58,16 @@ The game changed from **"the DJ's real Spotify playback is the song source"** to
 
 Structural only — no task content changed. The single ~3.9k-line plan was split so context stays small: this file is now the **index** (intro, revision notes, Agent Session Protocol, File Map, the task list, Resolved Design Decisions, Self-Review), and each task's full content (prerequisites, steps, exact code, commit) moved verbatim to `2026-05-29-listening-road-trip/task-NN-*.md`. The index lists one line per task with its sub-file route **and final commit subject**, so the Session-Start "next task = lowest task whose commit isn't in `git log`" rule still works without opening every file. This path is unchanged, so CLAUDE.md and memory links still resolve.
 
+### Revision Note 6 (2026-05-30, DJ-flavour song selection incl. local language)
+
+The AI DJ now selects songs from **three** taste inputs instead of one, so genre/decade candidates respect the DJ's flavour — especially **local language** (e.g. Hebrew):
+
+1. **Seed flavours gain `languages: string[]`** — multi-select preset chips (English, Hebrew, Spanish, …) on the create form, stored in `seed_prefs`. Biases picks from batch 1. (Tasks 2, 7, 8, 10, 15.)
+2. **DJ taste seed (the main new signal)** — at **ride start** the DO fetches the creator's own Spotify **top + liked tracks** (`fetchDjTasteSeed`, scopes `user-top-read` + `user-library-read`), de-dupes/caps to ~30, caches in memory and persists to a new `trips.dj_taste_seed` column (survives DO eviction). Used once with the live token — *not* fetched at the OAuth callback, so it reflects taste when the trip begins, not when Spotify was linked. Naturally surfaces Hebrew if the DJ listens to Hebrew. (Tasks 2, 3, 4, 6, 7, 17.)
+3. **In-trip ratings** — the existing crowd-favorites/flops replan signal, unchanged.
+
+`generateSongBatch(seed, history, alreadyPlayed, djTaste, apiKey, count)` weaves all three into the prompt; the DJ taste seed **augments**, never overrides, what the crowd actually rates. New scopes are reflected in Task 7 (`SPOTIFY_SCOPES`), Task 17 (deploy notes), and CLAUDE.md.
+
 ---
 
 ## Agent Session Protocol

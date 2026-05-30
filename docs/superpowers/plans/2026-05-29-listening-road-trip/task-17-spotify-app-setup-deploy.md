@@ -19,7 +19,7 @@ In the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), c
 
 Add the redirect URI(s) you'll actually use (prod, and a tunnel URL if testing OAuth locally), add your DJ account email(s) under User Management, and note the Client ID and Client Secret.
 
-> **AI-DJ runtime requirements (hard constraints):** the OAuth scopes are `user-read-playback-state user-modify-playback-state user-read-currently-playing` (set in `index.ts`) — the **modify** scope is what lets the app `play` tracks on the DJ's device. The DJ must have **Spotify Premium** (playback control is Premium-only) **and an active device** (an open Spotify app on phone/desktop/car) the moment the AI DJ starts; otherwise the first `play` 404s and the app shows a `playback_error` + Retry until a device is available. No song audio can be started purely server-side without an already-running Spotify client.
+> **AI-DJ runtime requirements (hard constraints):** the OAuth scopes are `user-read-playback-state user-modify-playback-state user-read-currently-playing user-top-read user-library-read` (set in `index.ts`) — the **modify** scope is what lets the app `play` tracks on the DJ's device, and **`user-top-read` + `user-library-read`** let the DO sample the DJ's own top/liked tracks at ride start to seed song selection (incl. local-language taste). These two are read-only and granted in the same consent screen; no extra Spotify-dashboard config is needed for them. The DJ must have **Spotify Premium** (playback control is Premium-only) **and an active device** (an open Spotify app on phone/desktop/car) the moment the AI DJ starts; otherwise the first `play` 404s and the app shows a `playback_error` + Retry until a device is available. No song audio can be started purely server-side without an already-running Spotify client.
 
 - [ ] **Step 2: Create the production D1 database**
 
@@ -57,7 +57,7 @@ Expected output includes `https://listening-road-trip.<your-account>.workers.dev
 
 - [ ] **Step 6: Smoke test production**
 
-1. `curl -X POST https://<app>.workers.dev/api/trips -H "Content-Type: application/json" -d '{"name":"Real Road Trip","creatorName":"Boaz","seedPrefs":{"genres":["Indie"],"decades":["2010s"],"energy":3}}'` → returns a trip.
+1. `curl -X POST https://<app>.workers.dev/api/trips -H "Content-Type: application/json" -d '{"name":"Real Road Trip","creatorName":"Boaz","seedPrefs":{"genres":["Indie"],"decades":["2010s"],"languages":["Hebrew"],"energy":3}}'` → returns a trip.
 2. Open the app, create a trip with seed flavours → complete the Spotify OAuth → land back on the trip page (with an open Spotify app on a Premium device).
 3. Within ~10s the AI DJ plays its first pick on your device → `song_started` broadcasts with a `reason`.
 4. Join from a second device, rate, and confirm the reveal at window close and that the next pick auto-plays.

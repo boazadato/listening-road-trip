@@ -61,12 +61,14 @@ export type ClientMessage =
 export interface SeedPrefs {
   genres: string[]
   decades: string[]
-  energy: number   // 1–5
+  languages: string[]   // preset language chips (multi-select) — biases the AI DJ toward local-language songs
+  energy: number        // 1–5
 }
 
 // Preset options for the create-trip flavour pickers.
 export const GENRE_OPTIONS = ['Pop', 'Hip-Hop', 'Rock', 'Indie', 'R&B', 'Electronic', 'Country', 'Latin', 'Metal', 'Jazz', 'Classical', 'Reggae'] as const
 export const DECADE_OPTIONS = ['60s', '70s', '80s', '90s', '2000s', '2010s', '2020s'] as const
+export const LANGUAGE_OPTIONS = ['English', 'Hebrew', 'Spanish', 'French', 'Arabic', 'Portuguese', 'German', 'Italian', 'Korean', 'Japanese', 'Hindi'] as const
 
 export interface LeaderboardEntry {
   song: { id: string; title: string; artist: string; albumArt: string | null; identified_at: number }

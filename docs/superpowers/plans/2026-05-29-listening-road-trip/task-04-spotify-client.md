@@ -31,7 +31,7 @@ Note: `audio-features` is **not** implemented — Spotify deprecated it for apps
 ```typescript
 // worker/test/spotify.test.ts
 import { describe, it, expect, vi } from 'vitest'
-import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying, searchTrack, startPlayback } from '../src/spotify'
+import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying, searchTrack, startPlayback, fetchDjTasteSeed } from '../src/spotify'
 
 describe('refreshAccessToken', () => {
   it('returns access token from Spotify response', async () => {
@@ -166,6 +166,50 @@ describe('startPlayback', () => {
     await expect(startPlayback('tok', 'spotify:track:tk1', undefined, mockFetch)).rejects.toThrow(/no active device/i)
   })
 })
+
+describe('fetchDjTasteSeed', () => {
+  it('merges the DJ top + liked tracks, de-dupes, and unwraps the liked-track shape', async () => {
+    const mockFetch = vi.fn()
+    mockFetch.mockImplementation((url: string) => {
+      if (String(url).includes('/me/top/tracks')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          items: [
+            { name: 'תל אביב', artists: [{ name: 'Static & Ben El' }] },
+            { name: 'Shared', artists: [{ name: 'Dup' }] },
+          ],
+        }), { headers: { 'Content-Type': 'application/json' } }))
+      }
+      // /me/tracks (liked) wraps each track under `.track`
+      return Promise.resolve(new Response(JSON.stringify({
+        items: [
+          { track: { name: 'Shared', artists: [{ name: 'Dup' }] } },
+          { track: { name: 'יש בי אהבה', artists: [{ name: 'Eyal Golan' }] } },
+        ],
+      }), { headers: { 'Content-Type': 'application/json' } }))
+    })
+    const seed = await fetchDjTasteSeed('tok', mockFetch)
+    expect(seed).toEqual([
+      { title: 'תל אביב', artist: 'Static & Ben El' },
+      { title: 'Shared', artist: 'Dup' },
+      { title: 'יש בי אהבה', artist: 'Eyal Golan' },
+    ])
+    const urls = mockFetch.mock.calls.map(c => String(c[0]))
+    expect(urls.some(u => u.includes('/me/top/tracks'))).toBe(true)
+    expect(urls.some(u => u.includes('/me/tracks'))).toBe(true)
+  })
+
+  it('still returns the other source when one scope/endpoint fails', async () => {
+    const mockFetch = vi.fn()
+    mockFetch.mockImplementation((url: string) =>
+      String(url).includes('/me/top/tracks')
+        ? Promise.resolve(new Response('{}', { status: 403 }))   // user-top-read not granted
+        : Promise.resolve(new Response(JSON.stringify({
+            items: [{ track: { name: 'Liked Only', artists: [{ name: 'A' }] } }],
+          }), { headers: { 'Content-Type': 'application/json' } }))
+    )
+    expect(await fetchDjTasteSeed('tok', mockFetch)).toEqual([{ title: 'Liked Only', artist: 'A' }])
+  })
+})
 ```
 
 - [ ] **Step 2: Run test — expect fail**
@@ -180,7 +224,7 @@ Expected: FAIL
 
 ```typescript
 // worker/src/spotify.ts
-import type { SpotifyTrack } from './types'
+import type { SpotifyTrack, DjTasteTrack } from './types'
 
 type FetchFn = typeof fetch
 
@@ -308,6 +352,63 @@ export async function startPlayback(
   })
   if (res.status === 404) throw new NoActiveDeviceError()
   if (!res.ok && res.status !== 204) throw new Error(`Spotify play failed: ${res.status}`)
+}
+
+// --- DJ taste seed (the DJ's own Spotify favorites) -----------------------------
+// Fetched at ride start by the DO (not at the OAuth callback — see Task 6), using a
+// freshly-refreshed access token, so the sample reflects the DJ's taste at the time
+// the trip actually begins. Surfaces their language/regional style (e.g. Hebrew)
+// from batch 1, before any in-trip ratings exist.
+
+function mapTracks(items: Array<Record<string, unknown>> | undefined): DjTasteTrack[] {
+  return (items ?? [])
+    .map(t => {
+      const name = t.name as string | undefined
+      if (!name) return null
+      const artists = (t.artists as Array<{ name: string }> | undefined) ?? []
+      return { title: name, artist: artists.map(a => a.name).join(', ') }
+    })
+    .filter((t): t is DjTasteTrack => t !== null)
+}
+
+// The DJ's top tracks (scope: user-top-read). medium_term ≈ last 6 months.
+export async function fetchTopTracks(accessToken: string, limit = 20, fetchFn: FetchFn = fetch): Promise<DjTasteTrack[]> {
+  const res = await fetchFn(`https://api.spotify.com/v1/me/top/tracks?limit=${limit}&time_range=medium_term`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!res.ok) throw new Error(`Spotify top tracks failed: ${res.status}`)
+  const data = await res.json<{ items?: Array<Record<string, unknown>> }>()
+  return mapTracks(data.items)
+}
+
+// The DJ's liked/saved tracks (scope: user-library-read). Each item wraps the track under `.track`.
+export async function fetchLikedTracks(accessToken: string, limit = 20, fetchFn: FetchFn = fetch): Promise<DjTasteTrack[]> {
+  const res = await fetchFn(`https://api.spotify.com/v1/me/tracks?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!res.ok) throw new Error(`Spotify liked tracks failed: ${res.status}`)
+  const data = await res.json<{ items?: Array<{ track?: Record<string, unknown> }> }>()
+  return mapTracks((data.items ?? []).map(i => i.track).filter((t): t is Record<string, unknown> => !!t))
+}
+
+// Merge top + liked into a de-duped, capped taste sample for the AI-DJ batch prompt.
+// Best-effort: either source failing contributes nothing (the caller also wraps this
+// in try/catch, so a total failure just leaves the DJ on seed flavours + ratings).
+export async function fetchDjTasteSeed(accessToken: string, fetchFn: FetchFn = fetch): Promise<DjTasteTrack[]> {
+  const [top, liked] = await Promise.all([
+    fetchTopTracks(accessToken, 20, fetchFn).catch(() => [] as DjTasteTrack[]),
+    fetchLikedTracks(accessToken, 20, fetchFn).catch(() => [] as DjTasteTrack[]),
+  ])
+  const seen = new Set<string>()
+  const merged: DjTasteTrack[] = []
+  for (const t of [...top, ...liked]) {
+    const key = `${t.title.toLowerCase()}|${t.artist.toLowerCase()}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(t)
+    if (merged.length >= 30) break
+  }
+  return merged
 }
 ```
 

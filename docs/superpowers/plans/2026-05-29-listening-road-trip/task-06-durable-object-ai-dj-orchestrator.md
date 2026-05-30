@@ -22,11 +22,11 @@ The Durable Object is the heart of the app — now the **AI DJ orchestrator**. I
 
 ```typescript
 // worker/src/TripRoom.ts
-import { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, NoActiveDeviceError } from './spotify'
-import { createSong, upsertRating, getTripById, getRatingSummary } from './db'
+import { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, fetchDjTasteSeed, NoActiveDeviceError } from './spotify'
+import { createSong, upsertRating, getTripById, getRatingSummary, setTripDjTasteSeed } from './db'
 import { generateSongBatch } from './claude'
 import { generateId } from './utils'
-import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState, SpotifyTrack, SeedPrefs } from './types'
+import type { Env, ServerMessage, ClientMessage, SongInfo, RatingInfo, TripState, SpotifyTrack, SeedPrefs, DjTasteTrack } from './types'
 
 const MIN_FLOOR_MS = 20 * 1000        // floor a window so very short tracks still get rating time
 const MAX_CAP_MS = 6 * 60 * 1000      // safety cap so a stuck/paused song still reveals
@@ -55,6 +55,7 @@ export class TripRoom implements DurableObject {
   private accessToken: string | null = null
   private tokenExpiresAt = 0
   private generating = false   // guards against overlapping batch generations (prefetch + on-demand)
+  private djTaste: DjTasteTrack[] | null = null   // DJ's own Spotify favorites, fetched once at ride start (null = not yet loaded)
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -320,9 +321,10 @@ export class TripRoom implements DurableObject {
     this.generating = true
     try {
       const seed = await this.getSeedPrefs(tripId)
+      const djTaste = await this.getDjTasteSeed(tripId, token)        // DJ's own Spotify favorites (language/style signal)
       const history = await getRatingSummary(this.env.DB, tripId)   // rated songs + avg score (adaptation)
       const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
-      const picks = await generateSongBatch(seed, history, played, this.env.CLAUDE_API_KEY, BATCH_SIZE)
+      const picks = await generateSongBatch(seed, history, played, djTaste, this.env.CLAUDE_API_KEY, BATCH_SIZE)
 
       const resolved: SpotifyTrack[] = []
       for (const pick of picks) {
@@ -351,10 +353,32 @@ export class TripRoom implements DurableObject {
   }
 
   private async getSeedPrefs(tripId: string): Promise<SeedPrefs> {
-    const fallback: SeedPrefs = { genres: [], decades: [], energy: 3 }
+    const fallback: SeedPrefs = { genres: [], decades: [], languages: [], energy: 3 }
     const trip = await getTripById(this.env.DB, tripId)
     if (!trip?.seed_prefs) return fallback
     try { return { ...fallback, ...(JSON.parse(trip.seed_prefs) as Partial<SeedPrefs>) } } catch { return fallback }
+  }
+
+  // The DJ's own Spotify favorites — fetched once, at ride start, with the live token
+  // (so it reflects their taste when the trip begins, not whenever they linked Spotify;
+  // this is why the OAuth callback does NOT fetch it). Cached in memory and persisted to
+  // D1 so it survives DO eviction mid-ride. Best-effort: on failure we cache an empty
+  // sample so we don't re-hit Spotify every batch, and the DJ runs on seed + ratings.
+  private async getDjTasteSeed(tripId: string, token: string): Promise<DjTasteTrack[]> {
+    if (this.djTaste) return this.djTaste
+    const trip = await getTripById(this.env.DB, tripId)
+    if (trip?.dj_taste_seed) {
+      try { this.djTaste = JSON.parse(trip.dj_taste_seed) as DjTasteTrack[]; return this.djTaste } catch { /* fall through to refetch */ }
+    }
+    try {
+      const seed = await fetchDjTasteSeed(token)
+      this.djTaste = seed
+      if (seed.length > 0) await setTripDjTasteSeed(this.env.DB, tripId, JSON.stringify(seed))
+      return seed
+    } catch {
+      this.djTaste = []
+      return []
+    }
   }
 
   private async getAccessToken(): Promise<string | null> {

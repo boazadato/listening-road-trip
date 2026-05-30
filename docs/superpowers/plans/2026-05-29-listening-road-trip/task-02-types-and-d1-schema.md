@@ -19,7 +19,18 @@ ls package.json wrangler.toml worker/package.json frontend/package.json
 export interface SeedPrefs {
   genres: string[]
   decades: string[]
-  energy: number   // 1–5
+  languages: string[]   // preset language chips, e.g. ['English', 'Hebrew'] — biases candidates toward local-language songs from batch 1
+  energy: number        // 1–5
+}
+
+// A compact sample of the DJ's own Spotify taste (top + liked tracks), fetched
+// by the DO at ride start (with a freshly-refreshed token) and persisted here so it
+// survives DO eviction. Feeds the AI-DJ batch prompt so it infers the DJ's
+// language/regional style (e.g. Hebrew music) even before any in-trip ratings
+// exist. Augments — never replaces — the rating history signal.
+export interface DjTasteTrack {
+  title: string
+  artist: string
 }
 
 export interface Trip {
@@ -28,6 +39,7 @@ export interface Trip {
   short_code: string
   creator_name: string
   seed_prefs: string | null   // JSON-encoded SeedPrefs
+  dj_taste_seed: string | null // JSON-encoded DjTasteTrack[] — the DJ's own Spotify favorites (fetched by the DO at ride start)
   spotify_refresh_token: string | null
   created_at: number
 }
@@ -138,7 +150,8 @@ CREATE TABLE IF NOT EXISTS trips (
   name TEXT NOT NULL,
   short_code TEXT NOT NULL UNIQUE,
   creator_name TEXT NOT NULL,
-  seed_prefs TEXT,                 -- JSON: { genres: string[], decades: string[], energy: number }
+  seed_prefs TEXT,                 -- JSON: { genres: string[], decades: string[], languages: string[], energy: number }
+  dj_taste_seed TEXT,              -- JSON: DjTasteTrack[] — the DJ's own Spotify top/liked tracks (fetched by the DO at ride start)
   spotify_refresh_token TEXT,
   created_at INTEGER NOT NULL
 );

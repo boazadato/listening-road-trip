@@ -122,6 +122,13 @@ export async function setTripSpotifyToken(db: D1Database, tripId: string, refres
   await db.prepare('UPDATE trips SET spotify_refresh_token = ? WHERE id = ?').bind(refreshToken, tripId).run()
 }
 
+// Store the DJ's own Spotify taste sample (JSON-encoded DjTasteTrack[]), fetched by
+// the DO at ride start and persisted here so it survives DO eviction. Best-effort —
+// a null/failed fetch leaves it unset and the AI DJ falls back to seed flavours + ratings.
+export async function setTripDjTasteSeed(db: D1Database, tripId: string, djTasteSeedJson: string): Promise<void> {
+  await db.prepare('UPDATE trips SET dj_taste_seed = ? WHERE id = ?').bind(djTasteSeedJson, tripId).run()
+}
+
 export async function createParticipant(
   db: D1Database,
   p: Omit<Participant, 'joined_at'>

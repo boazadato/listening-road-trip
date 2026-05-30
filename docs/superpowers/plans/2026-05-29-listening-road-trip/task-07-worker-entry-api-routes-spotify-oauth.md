@@ -40,7 +40,9 @@ import type { Env, SeedPrefs } from './types'
 
 export { TripRoom }
 
-const SPOTIFY_SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing'
+// Playback-control scopes + the two read scopes the AI DJ needs to sample the DJ's
+// own taste at ride start (user-top-read = top tracks, user-library-read = liked songs).
+const SPOTIFY_SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing user-top-read user-library-read'
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -128,6 +130,7 @@ async function createTripHandler(request: Request, env: Env): Promise<Response> 
   const seed: SeedPrefs = {
     genres: Array.isArray(body.seedPrefs?.genres) ? body.seedPrefs!.genres.slice(0, 10) : [],
     decades: Array.isArray(body.seedPrefs?.decades) ? body.seedPrefs!.decades.slice(0, 10) : [],
+    languages: Array.isArray(body.seedPrefs?.languages) ? body.seedPrefs!.languages.slice(0, 10) : [],
     energy: Math.min(5, Math.max(1, Math.round(Number(body.seedPrefs?.energy) || 3))),
   }
 
@@ -137,6 +140,7 @@ async function createTripHandler(request: Request, env: Env): Promise<Response> 
     short_code: generateShortCode(),
     creator_name: body.creatorName.trim(),
     seed_prefs: JSON.stringify(seed),
+    dj_taste_seed: null,   // filled in later by the DO at ride start
     spotify_refresh_token: null,
   })
 
