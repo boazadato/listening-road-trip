@@ -210,6 +210,7 @@ The plan is split into one file per task under [`2026-05-29-listening-road-trip/
 - ✅ **Task 17** — [Spotify App Setup & Deploy to Cloudflare](2026-05-29-listening-road-trip/task-17-spotify-app-setup-deploy.md) — `chore: production deploy — D1 id, Spotify OAuth app, secrets, verified`
 - ⬜ **Task 18** — [Frontend Dependency Modernization (Tier B: full current)](2026-05-29-listening-road-trip/task-18-frontend-dependency-modernization.md) — `chore: modernize frontend deps — vite 6, react 19, react-router 7, zustand 5, vitest 4` *(deferred; see Revision Note 8)*
 - ✅ **Task 19** — [Skip Song](2026-05-29-listening-road-trip/task-19-skip-song.md) — `feat: skip song — creator skip button + auto-skip on thumbs-down crowd`
+- ⬜ **Task 20** — [Pause / Resume / Stop](2026-05-29-listening-road-trip/task-20-pause-resume-stop.md) — `feat: pause/resume + soft stop — creator controls, tripStatus DO state`
 
 ---
 
