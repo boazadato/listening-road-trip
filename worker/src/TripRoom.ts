@@ -24,6 +24,7 @@ const FALLBACK_WINDOW_MS = 90 * 1000  // used when a resolved track somehow lack
 const POLL_INTERVAL_MS = 5 * 1000     // 5 seconds
 const BATCH_SIZE = 5                   // songs Claude returns per generateSongBatch call
 const PREFETCH_AT = 1                  // when queue length drops to this, prefetch the next batch
+const AUTO_SKIP_THRESHOLD = 3          // avg rating strictly below this (😐) triggers auto-skip once a majority has rated
 const EMOJI_SCORES: Record<string, number> = {
   '🔥': 5, '❤️': 4, '😐': 3, '😬': 2, '💀': 1,
 }
@@ -78,6 +79,15 @@ export class TripRoom implements DurableObject {
       const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
       const windowOpen = !!windowEndsAt && Date.now() < windowEndsAt
       if (!current || !windowOpen) await this.advanceToNextSong()
+      return new Response('OK')
+    }
+
+    if (url.pathname === '/skip') {
+      const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+      if (windowEndsAt) {            // a song is currently playing
+        await this.revealRatings()
+        await this.advanceToNextSong()
+      }
       return new Response('OK')
     }
 
@@ -171,6 +181,16 @@ export class TripRoom implements DurableObject {
       ratedCount: Object.keys(ratings).length,
       totalCount: this.ctx.getWebSockets().length,
     })
+
+    // Auto-skip: once a majority of connected participants have rated and the
+    // running average is below neutral, cut the song short.
+    const total = this.ctx.getWebSockets().length
+    const rated = Object.values(ratings)
+    const avg = rated.reduce((s, r) => s + r.score, 0) / rated.length
+    if (rated.length > total / 2 && avg < AUTO_SKIP_THRESHOLD) {
+      await this.revealRatings()
+      await this.advanceToNextSong()
+    }
   }
 
   async alarm(): Promise<void> {
