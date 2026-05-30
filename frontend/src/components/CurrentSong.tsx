@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { useTripStore } from '../hooks/useTripStore'
 import RatingButtons from './RatingButtons'
 import CountdownTimer from './CountdownTimer'
@@ -5,11 +6,15 @@ import RatingReveal from './RatingReveal'
 
 interface Props {
   onRate: (songId: string, emoji: string) => void
+  isCreator?: boolean
+  onSkip?: () => void
 }
 
-export default function CurrentSong({ onRate }: Props) {
+export default function CurrentSong({ onRate, isCreator, onSkip }: Props) {
   const { currentSong, windowEndsAt, ratedCount, totalCount, myRating, lastReveal } = useTripStore()
   const isWindowOpen = !!windowEndsAt && Date.now() < windowEndsAt
+  const [skipping, setSkipping] = useState(false)
+  useEffect(() => { setSkipping(false) }, [currentSong?.id])
 
   if (!currentSong && !lastReveal) {
     return (
@@ -66,6 +71,24 @@ export default function CurrentSong({ onRate }: Props) {
         disabled={!isWindowOpen}
         onSelect={(emoji) => { if (isWindowOpen) onRate(currentSong.id, emoji) }}
       />
+
+      {isCreator && isWindowOpen && onSkip && (
+        <button
+          onClick={() => { setSkipping(true); onSkip() }}
+          disabled={skipping}
+          style={{
+            display: 'block',
+            margin: '16px auto 0',
+            background: 'var(--surface2)',
+            color: 'var(--text)',
+            fontSize: 13,
+            padding: '8px 18px',
+            opacity: skipping ? 0.6 : 1,
+          }}
+        >
+          {skipping ? '⏭ Skipping…' : '⏭ Skip song'}
+        </button>
+      )}
 
       {!isWindowOpen && <div style={{ textAlign: 'center', color: 'var(--text-dim)', fontSize: 14 }}>Rating closed</div>}
     </div>

@@ -97,7 +97,13 @@ export default function Trip() {
 
       <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
         {showDjPrompt && <ConnectSpotify tripId={tripId} isCreator={isCreator} creatorName={creatorName} />}
-        {!showDjPrompt && tab === 'song' && <CurrentSong onRate={sendRating} />}
+        {!showDjPrompt && tab === 'song' && (
+          <CurrentSong
+            onRate={sendRating}
+            isCreator={isCreator}
+            onSkip={() => { fetch(`/api/trips/${code}/skip`, { method: 'POST' }).catch(() => {}) }}
+          />
+        )}
         {tab === 'leaderboard' && <Leaderboard code={code ?? ''} />}
         {tab === 'analysis' && <Analysis code={code ?? ''} />}
       </div>
