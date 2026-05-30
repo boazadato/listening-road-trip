@@ -68,6 +68,10 @@ The AI DJ now selects songs from **three** taste inputs instead of one, so genre
 
 `generateSongBatch(seed, history, alreadyPlayed, djTaste, apiKey, count)` weaves all three into the prompt; the DJ taste seed **augments**, never overrides, what the crowd actually rates. New scopes are reflected in Task 7 (`SPOTIFY_SCOPES`), Task 17 (deploy notes), and CLAUDE.md.
 
+### Revision Note 7 (2026-05-30, explicit task-status tracking)
+
+Process-only — no task content changed. Task completion is now tracked by an explicit status marker (⬜ todo · 🔄 in progress · ✅ done) on each task in the [Tasks](#tasks) list, and **this index is the single source of truth for status**. Previously "done" was inferred from `git log` ("lowest task whose final commit subject isn't in the log") — but commit subjects carry no machine-readable task link, so the match was manual and fuzzy. The marker is now flipped to ✅ **in the same commit** that completes the task (Session End), so status can't drift from the work: the doc change and the code change land together. The final commit subject stays next to each task as a cross-check. CLAUDE.md's "next task" rule points here, not at git history. Backfilled Tasks 1–4 as ✅ (their commits are in the log).
+
 ---
 
 ## Agent Session Protocol
@@ -77,14 +81,14 @@ The AI DJ now selects songs from **three** taste inputs instead of one, so genre
 ### Session Start
 
 1. Read `CLAUDE.md` — stack, Makefile commands, testing strategy, architecture notes
-2. Identify the next task: the lowest-numbered task below whose final commit isn't yet in `git log` (`git log --oneline` — each task's commit message is in its final step). Tasks are ordered by dependency; do them in order.
+2. Identify the next task: the lowest-numbered task still marked ⬜ in the [Tasks](#tasks) list below — that list is the source of truth for status. Tasks are ordered by dependency; do them in order. (`git log --oneline` is only a cross-check, not the status signal.)
 3. Read the full task section below including prerequisites, steps, and code
 4. Verify prerequisites: run the file-existence checks at the top of your task
 5. Run `pnpm install` from the repo root if `node_modules` are missing
 
 ### Session End (every task)
 
-After the task's final commit, `git push`, then mark the task completed in the Claude Code task list (TaskUpdate → completed).
+As part of the task's final commit, flip its marker in the [Tasks](#tasks) list from ⬜ (or 🔄) to ✅ — the status lives in this file, so it must land in the same commit. Then `git push` and mark the task completed in the Claude Code task list (TaskUpdate → completed). If you start a task but don't finish it in the session, set its marker to 🔄 so the next session knows it's mid-flight.
 
 ### Working Directories
 
@@ -168,25 +172,29 @@ Commands prefixed with `cd frontend` run from `<root>/frontend/`.
 
 ## Tasks
 
-The plan is split into one file per task under [`2026-05-29-listening-road-trip/`](2026-05-29-listening-road-trip/). Each file is self-contained (prerequisites, steps, exact code, commit). **Pick up the lowest-numbered task whose final commit subject (below) isn't yet in `git log --oneline`.**
+The plan is split into one file per task under [`2026-05-29-listening-road-trip/`](2026-05-29-listening-road-trip/). Each file is self-contained (prerequisites, steps, exact code, commit).
 
-- **Task 1** — [Project Scaffold](2026-05-29-listening-road-trip/task-01-project-scaffold.md) — `feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config`
-- **Task 2** — [Types & D1 Schema](2026-05-29-listening-road-trip/task-02-types-and-d1-schema.md) — `feat: types and D1 schema (seed prefs, AI-DJ song fields, per-trip token, analysis cache)`
-- **Task 3** — [Utils & D1 Helpers](2026-05-29-listening-road-trip/task-03-utils-and-d1-helpers.md) — `feat: utils and D1 helpers — seed prefs, rating summary, single-JOIN leaderboard, analysis cache`
-- **Task 4** — [Spotify Client](2026-05-29-listening-road-trip/task-04-spotify-client.md) — `feat: Spotify client — token refresh, OAuth exchange, currently-playing, track search + playback control`
-- **Task 5** — [Claude — Song Selection + Taste Generator](2026-05-29-listening-road-trip/task-05-claude-song-selection.md) — `feat: Claude client — AI-DJ song batch selection + personality + group taste`
-- **Task 6** — [Durable Object — AI-DJ Orchestrator](2026-05-29-listening-road-trip/task-06-durable-object-ai-dj-orchestrator.md) — `feat: TripRoom DO — AI-DJ orchestration (batch/replan/playback), WS hub, direct D1 writes`
-- **Task 7** — [Worker Entry Point, API Routes & Spotify OAuth](2026-05-29-listening-road-trip/task-07-worker-entry-api-routes-spotify-oauth.md) — `feat: Worker routes — trips + seed prefs, leaderboard, cached analysis, Spotify OAuth (playback scope), WS upgrade`
-- **Task 8** — [Frontend Types & Store](2026-05-29-listening-road-trip/task-08-frontend-types-and-store.md) — `feat: frontend types and Zustand trip store (seed prefs, djActive, playbackError, lastReveal)`
-- **Task 9** — [WebSocket Hook](2026-05-29-listening-road-trip/task-09-websocket-hook.md) — `feat: WebSocket hook with reactive connection state and auto-reconnect`
-- **Task 10** — [Home Page — Create & Join Forms](2026-05-29-listening-road-trip/task-10-home-page-create-join-forms.md) — `feat: Home page — create form with seed flavours (→ Spotify OAuth) and join form`
-- **Task 11** — [Trip Page — Layout, Tabs, WebSocket & DJ Connect](2026-05-29-listening-road-trip/task-11-trip-page-layout-tabs-ws-dj-connect.md) — `feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt`
-- **Task 12** — [Current Song Tab](2026-05-29-listening-road-trip/task-12-current-song-tab.md) — `feat: CurrentSong tab — song card, emoji rating, countdown, reveal`
-- **Task 13** — [Leaderboard Tab](2026-05-29-listening-road-trip/task-13-leaderboard-tab.md) — `feat: Leaderboard tab with hall of shame styling`
-- **Task 14** — [Analysis Tab](2026-05-29-listening-road-trip/task-14-analysis-tab.md) — `feat: Analysis tab — group taste summary and Claude personality cards`
-- **Task 15** — [API Integration & Frontend Behavior Tests](2026-05-29-listening-road-trip/task-15-api-integration-frontend-tests.md) — `test: API integration (SELF) + frontend behavior tests`
-- **Task 16** — [Build & Playwright E2E (Golden Path)](2026-05-29-listening-road-trip/task-16-build-playwright-e2e.md) — `chore: E2E golden path verified via Playwright MCP`
-- **Task 17** — [Spotify App Setup & Deploy to Cloudflare](2026-05-29-listening-road-trip/task-17-spotify-app-setup-deploy.md) — `chore: production deploy — D1 id, Spotify OAuth app, secrets, verified`
+**This list is the source of truth for task status.** Pick up the lowest-numbered task still marked ⬜. When a task's final commit lands, flip its marker here to ✅ in the same commit (Session End). The final commit subject is kept next to each task as a cross-check, not as the status signal.
+
+**Status:** ⬜ todo · 🔄 in progress · ✅ done
+
+- ✅ **Task 1** — [Project Scaffold](2026-05-29-listening-road-trip/task-01-project-scaffold.md) — `feat: scaffold project — pnpm workspaces, Worker, React/Vite, wrangler config`
+- ✅ **Task 2** — [Types & D1 Schema](2026-05-29-listening-road-trip/task-02-types-and-d1-schema.md) — `feat: types and D1 schema (seed prefs, AI-DJ song fields, per-trip token, analysis cache)`
+- ✅ **Task 3** — [Utils & D1 Helpers](2026-05-29-listening-road-trip/task-03-utils-and-d1-helpers.md) — `feat: utils and D1 helpers — seed prefs, rating summary, single-JOIN leaderboard, analysis cache`
+- ✅ **Task 4** — [Spotify Client](2026-05-29-listening-road-trip/task-04-spotify-client.md) — `feat: Spotify client — token refresh, OAuth exchange, currently-playing, track search + playback control`
+- ⬜ **Task 5** — [Claude — Song Selection + Taste Generator](2026-05-29-listening-road-trip/task-05-claude-song-selection.md) — `feat: Claude client — AI-DJ song batch selection + personality + group taste`
+- ⬜ **Task 6** — [Durable Object — AI-DJ Orchestrator](2026-05-29-listening-road-trip/task-06-durable-object-ai-dj-orchestrator.md) — `feat: TripRoom DO — AI-DJ orchestration (batch/replan/playback), WS hub, direct D1 writes`
+- ⬜ **Task 7** — [Worker Entry Point, API Routes & Spotify OAuth](2026-05-29-listening-road-trip/task-07-worker-entry-api-routes-spotify-oauth.md) — `feat: Worker routes — trips + seed prefs, leaderboard, cached analysis, Spotify OAuth (playback scope), WS upgrade`
+- ⬜ **Task 8** — [Frontend Types & Store](2026-05-29-listening-road-trip/task-08-frontend-types-and-store.md) — `feat: frontend types and Zustand trip store (seed prefs, djActive, playbackError, lastReveal)`
+- ⬜ **Task 9** — [WebSocket Hook](2026-05-29-listening-road-trip/task-09-websocket-hook.md) — `feat: WebSocket hook with reactive connection state and auto-reconnect`
+- ⬜ **Task 10** — [Home Page — Create & Join Forms](2026-05-29-listening-road-trip/task-10-home-page-create-join-forms.md) — `feat: Home page — create form with seed flavours (→ Spotify OAuth) and join form`
+- ⬜ **Task 11** — [Trip Page — Layout, Tabs, WebSocket & DJ Connect](2026-05-29-listening-road-trip/task-11-trip-page-layout-tabs-ws-dj-connect.md) — `feat: Trip page — tabs, reconnect toast, QR share, DJ connect prompt`
+- ⬜ **Task 12** — [Current Song Tab](2026-05-29-listening-road-trip/task-12-current-song-tab.md) — `feat: CurrentSong tab — song card, emoji rating, countdown, reveal`
+- ⬜ **Task 13** — [Leaderboard Tab](2026-05-29-listening-road-trip/task-13-leaderboard-tab.md) — `feat: Leaderboard tab with hall of shame styling`
+- ⬜ **Task 14** — [Analysis Tab](2026-05-29-listening-road-trip/task-14-analysis-tab.md) — `feat: Analysis tab — group taste summary and Claude personality cards`
+- ⬜ **Task 15** — [API Integration & Frontend Behavior Tests](2026-05-29-listening-road-trip/task-15-api-integration-frontend-tests.md) — `test: API integration (SELF) + frontend behavior tests`
+- ⬜ **Task 16** — [Build & Playwright E2E (Golden Path)](2026-05-29-listening-road-trip/task-16-build-playwright-e2e.md) — `chore: E2E golden path verified via Playwright MCP`
+- ⬜ **Task 17** — [Spotify App Setup & Deploy to Cloudflare](2026-05-29-listening-road-trip/task-17-spotify-app-setup-deploy.md) — `chore: production deploy — D1 id, Spotify OAuth app, secrets, verified`
 
 ---
 
