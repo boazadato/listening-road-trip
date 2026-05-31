@@ -25,6 +25,8 @@ function fakeDeps(over: Partial<TripRoomDeps> = {}): TripRoomDeps {
     fetchCurrentlyPlaying: vi.fn().mockResolvedValue(null),
     searchTrack: vi.fn().mockResolvedValue(track()),
     startPlayback: vi.fn().mockResolvedValue(undefined),
+    pausePlayback: vi.fn().mockResolvedValue(undefined),
+    resumePlayback: vi.fn().mockResolvedValue(undefined),
     fetchDjTasteSeed: vi.fn().mockResolvedValue([]),
     generateSongBatch: vi.fn().mockResolvedValue([{ title: 'Song', artist: 'Artist', reason: 'fits the vibe' }]),
     ...over,
@@ -166,5 +168,229 @@ describe('TripRoom AI-DJ orchestration', () => {
     expect(types).toContain('rating_reveal')
     expect(types).toContain('song_started')
     expect(types.indexOf('song_started')).toBeGreaterThan(types.indexOf('rating_reveal'))
+  })
+})
+
+describe('pause/resume/stop', () => {
+  it('pause freezes window, calls pausePlayback, broadcasts trip_paused', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    const sent: ServerMessage[] = []
+    const now = Date.now()
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('currentSong', { id: 's1', spotifyTrackId: 't1', title: 'Song', artist: 'Artist', albumArt: null, reason: null })
+      await state.storage.put('windowEndsAt', now + 30_000)
+      spyBroadcasts(instance, sent)
+    })
+    await stub.fetch('https://do/pause', { method: 'POST' })
+
+    const tripStatus = await runInDurableObject(stub, (_i: any, s) => s.storage.get('tripStatus'))
+    expect(tripStatus).toBe('paused')
+
+    const windowEndsAt = await runInDurableObject(stub, (_i: any, s) => s.storage.get('windowEndsAt'))
+    expect(windowEndsAt).toBeUndefined()
+
+    const remaining = await runInDurableObject(stub, (_i: any, s) => s.storage.get<number>('pausedRemainingMs'))
+    expect(remaining).toBeGreaterThan(29_000)
+    expect(remaining).toBeLessThanOrEqual(30_000)
+
+    expect(deps.pausePlayback).toHaveBeenCalledWith('tok')
+    expect(sent.some(m => m.type === 'trip_paused')).toBe(true)
+  })
+
+  it('pause is a no-op when already paused', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+    })
+    await stub.fetch('https://do/pause', { method: 'POST' })
+    await stub.fetch('https://do/pause', { method: 'POST' })
+    expect(deps.pausePlayback).toHaveBeenCalledTimes(1)
+  })
+
+  it('resume restores window, calls resumePlayback, broadcasts trip_resumed', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    const sent: ServerMessage[] = []
+    const pausedRemaining = 25_000
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('tripStatus', 'paused')
+      await state.storage.put('pausedRemainingMs', pausedRemaining)
+      await state.storage.put('currentSong', { id: 's1', spotifyTrackId: 't1', title: 'Song', artist: 'Artist', albumArt: null, reason: null })
+      spyBroadcasts(instance, sent)
+    })
+    const beforeResume = Date.now()
+    await stub.fetch('https://do/resume', { method: 'POST' })
+
+    const tripStatus = await runInDurableObject(stub, (_i: any, s) => s.storage.get('tripStatus'))
+    expect(tripStatus).toBe('active')
+
+    const windowEndsAt = await runInDurableObject(stub, (_i: any, s) => s.storage.get<number>('windowEndsAt'))
+    expect(windowEndsAt).toBeGreaterThanOrEqual(beforeResume + pausedRemaining - 100)
+
+    const pausedRemainingMs = await runInDurableObject(stub, (_i: any, s) => s.storage.get('pausedRemainingMs'))
+    expect(pausedRemainingMs).toBeUndefined()
+
+    expect(deps.resumePlayback).toHaveBeenCalledWith('tok')
+    const resumed = sent.find(m => m.type === 'trip_resumed') as Extract<ServerMessage, { type: 'trip_resumed' }> | undefined
+    expect(resumed).toBeTruthy()
+    expect(typeof resumed!.windowEndsAt).toBe('number')
+  })
+
+  it('resume with no open window calls advanceToNextSong', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('tripStatus', 'paused')
+      // no pausedRemainingMs / windowEndsAt → paused between songs
+      spyBroadcasts(instance, sent)
+    })
+    await stub.fetch('https://do/resume', { method: 'POST' })
+
+    expect(deps.startPlayback).toHaveBeenCalled()
+    expect(sent.some(m => m.type === 'song_started')).toBe(true)
+  })
+
+  it('resume when device gone broadcasts playback_error', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps({ resumePlayback: vi.fn().mockRejectedValue(new NoActiveDeviceError()) })
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('tripStatus', 'paused')
+      await state.storage.put('pausedRemainingMs', 20_000)
+      spyBroadcasts(instance, sent)
+    })
+    await stub.fetch('https://do/resume', { method: 'POST' })
+
+    expect(sent.some(m => m.type === 'playback_error')).toBe(true)
+    expect(sent.some(m => m.type === 'trip_resumed')).toBe(false)
+    const djActive = await runInDurableObject(stub, (_i: any, s) => s.storage.get('djActive'))
+    expect(djActive).toBe(false)
+  })
+
+  it('stop halts the loop and broadcasts trip_stopped', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    const sent: ServerMessage[] = []
+
+    // Connect one WS so the alarm billing guard passes
+    const wsRes = await stub.fetch(`http://do/ws?participantId=p1&participantName=A&tripId=${tripId}`, {
+      headers: { Upgrade: 'websocket' },
+    })
+    wsRes.webSocket?.accept()
+
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.setAlarm(Date.now() + 5_000)   // arm the alarm
+      spyBroadcasts(instance, sent)
+    })
+    await stub.fetch('https://do/stop', { method: 'POST' })
+
+    const tripStatus = await runInDurableObject(stub, (_i: any, s) => s.storage.get('tripStatus'))
+    expect(tripStatus).toBe('stopped')
+    expect(sent.some(m => m.type === 'trip_stopped')).toBe(true)
+
+    // Run the alarm — it should exit early (stopped) and NOT reschedule
+    await runDurableObjectAlarm(stub)
+    const alarm = await runInDurableObject(stub, (_i: any, s) => s.storage.getAlarm())
+    expect(alarm).toBeNull()
+  })
+
+  it('stop while batch generating: guard prevents song_started', async () => {
+    const { stub, tripId } = await setupRoom()
+    let resolveGenerate!: (v: { title: string; artist: string; reason: string }[]) => void
+    const generatePromise = new Promise<{ title: string; artist: string; reason: string }[]>(res => { resolveGenerate = res })
+    const deps = fakeDeps({ generateSongBatch: vi.fn().mockReturnValue(generatePromise) })
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      spyBroadcasts(instance, sent)
+    })
+
+    // Start advancing (will stall waiting on the batch)
+    const advancePromise = runInDurableObject(stub, async (instance: any) => {
+      await instance.advanceToNextSong()
+    })
+
+    // Stop the trip before the batch resolves
+    await runInDurableObject(stub, (_i: any, s) => s.storage.put('tripStatus', 'stopped'))
+
+    // Now resolve the batch
+    resolveGenerate([{ title: 'Song', artist: 'Artist', reason: 'r' }])
+    await advancePromise
+
+    expect(deps.startPlayback).not.toHaveBeenCalled()
+    expect(sent.some(m => m.type === 'song_started')).toBe(false)
+  })
+
+  it('alarm reschedules while paused but skips advance and reconcile', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    const sent: ServerMessage[] = []
+
+    const wsRes = await stub.fetch(`http://do/ws?participantId=p1&participantName=A&tripId=${tripId}`, {
+      headers: { Upgrade: 'websocket' },
+    })
+    wsRes.webSocket?.accept()
+
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('tripStatus', 'paused')
+      await state.storage.put('currentSong', { id: 's1', spotifyTrackId: 't1', title: 'Song', artist: 'Artist', albumArt: null, reason: null })
+      // No windowEndsAt (cleared on pause)
+      spyBroadcasts(instance, sent)
+    })
+
+    await runDurableObjectAlarm(stub)
+
+    expect(sent.some(m => m.type === 'rating_reveal')).toBe(false)
+    expect(sent.some(m => m.type === 'song_started')).toBe(false)
+    const alarm = await runInDurableObject(stub, (_i: any, s) => s.storage.getAlarm())
+    expect(alarm).not.toBeNull()
+  })
+
+  it('ensurePolling does not arm when stopped', async () => {
+    const { stub, tripId } = await setupRoom()
+    await runInDurableObject(stub, async (instance: any, state) => {
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('tripStatus', 'stopped')
+      await state.storage.deleteAlarm()
+      await instance.ensurePolling()
+    })
+    const alarm = await runInDurableObject(stub, (_i: any, s) => s.storage.getAlarm())
+    expect(alarm).toBeNull()
+  })
+
+  it('restart resets status and starts playback', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps()
+    const sent: ServerMessage[] = []
+    await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('tripStatus', 'stopped')
+      spyBroadcasts(instance, sent)
+    })
+    await stub.fetch('https://do/start-djing', { method: 'POST' })
+
+    const tripStatus = await runInDurableObject(stub, (_i: any, s) => s.storage.get('tripStatus'))
+    expect(tripStatus).toBe('active')
+    const pausedRemainingMs = await runInDurableObject(stub, (_i: any, s) => s.storage.get('pausedRemainingMs'))
+    expect(pausedRemainingMs).toBeUndefined()
+    expect(deps.startPlayback).toHaveBeenCalled()
   })
 })

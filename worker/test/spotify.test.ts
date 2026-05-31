@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying, searchTrack, startPlayback, fetchDjTasteSeed } from '../src/spotify'
+import { refreshAccessToken, exchangeCodeForToken, parseCurrentlyPlaying, searchTrack, startPlayback, pausePlayback, resumePlayback, fetchDjTasteSeed, NoActiveDeviceError } from '../src/spotify'
 
 describe('refreshAccessToken', () => {
   it('returns access token from Spotify response', async () => {
@@ -132,6 +132,41 @@ describe('startPlayback', () => {
   it('throws NoActiveDeviceError on 404', async () => {
     const mockFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 404 }))
     await expect(startPlayback('tok', 'spotify:track:tk1', undefined, mockFetch)).rejects.toThrow(/no active device/i)
+  })
+})
+
+describe('pausePlayback', () => {
+  it('sends PUT to /v1/me/player/pause with no body', async () => {
+    let captured: Request | undefined
+    const fakeFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      captured = new Request(input as string, init)
+      return new Response(null, { status: 204 })
+    }
+    await pausePlayback('tok', fakeFetch as typeof fetch)
+    expect(new URL(captured!.url).pathname).toBe('/v1/me/player/pause')
+    expect(captured!.method).toBe('PUT')
+  })
+
+  it('does not throw on 404 (no active device)', async () => {
+    const fakeFetch = async () => new Response(null, { status: 404 })
+    await expect(pausePlayback('tok', fakeFetch as typeof fetch)).resolves.toBeUndefined()
+  })
+})
+
+describe('resumePlayback', () => {
+  it('sends PUT to /v1/me/player/play with no body (continue, not restart)', async () => {
+    let capturedInit: RequestInit | undefined
+    const fakeFetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedInit = init
+      return new Response(null, { status: 204 })
+    }
+    await resumePlayback('tok', fakeFetch as typeof fetch)
+    expect(capturedInit?.body).toBeUndefined()
+  })
+
+  it('throws NoActiveDeviceError on 404', async () => {
+    const fakeFetch = async () => new Response(null, { status: 404 })
+    await expect(resumePlayback('tok', fakeFetch as typeof fetch)).rejects.toBeInstanceOf(NoActiveDeviceError)
   })
 })
 

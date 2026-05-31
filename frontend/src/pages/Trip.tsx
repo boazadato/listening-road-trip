@@ -47,7 +47,7 @@ export default function Trip() {
           s.applyStateSync({
             tripId: trip.id, tripName: trip.name, shortCode: trip.short_code,
             djConnected: trip.djConnected, djActive: true, participants: [], currentSong: null,
-            windowEndsAt: null, ratedCount: 0, myRating: null,
+            windowEndsAt: null, ratedCount: 0, myRating: null, status: 'active', pausedRemainingMs: null,
           })
         }
       })
@@ -102,6 +102,10 @@ export default function Trip() {
             onRate={sendRating}
             isCreator={isCreator}
             onSkip={() => fetch(`/api/trips/${code}/skip`, { method: 'POST' })}
+            onPause={() => fetch(`/api/trips/${code}/pause`, { method: 'POST' })}
+            onResume={() => fetch(`/api/trips/${code}/resume`, { method: 'POST' })}
+            onStop={() => fetch(`/api/trips/${code}/stop`, { method: 'POST' })}
+            onRestart={() => fetch(`/api/trips/${code}/retry-dj`, { method: 'POST' })}
           />
         )}
         {tab === 'leaderboard' && <Leaderboard code={code ?? ''} />}

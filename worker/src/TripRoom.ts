@@ -1,4 +1,4 @@
-import { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, fetchDjTasteSeed, NoActiveDeviceError } from './spotify'
+import { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, pausePlayback, resumePlayback, fetchDjTasteSeed, NoActiveDeviceError } from './spotify'
 import { createSong, upsertRating, getTripById, getRatingSummary, setTripDjTasteSeed } from './db'
 import { generateSongBatch } from './claude'
 import { generateId } from './utils'
@@ -13,10 +13,12 @@ export interface TripRoomDeps {
   fetchCurrentlyPlaying: typeof fetchCurrentlyPlaying
   searchTrack: typeof searchTrack
   startPlayback: typeof startPlayback
+  pausePlayback: typeof pausePlayback
+  resumePlayback: typeof resumePlayback
   fetchDjTasteSeed: typeof fetchDjTasteSeed
   generateSongBatch: typeof generateSongBatch
 }
-const DEFAULT_DEPS: TripRoomDeps = { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, fetchDjTasteSeed, generateSongBatch }
+const DEFAULT_DEPS: TripRoomDeps = { refreshAccessToken, fetchCurrentlyPlaying, searchTrack, startPlayback, pausePlayback, resumePlayback, fetchDjTasteSeed, generateSongBatch }
 
 const MIN_FLOOR_MS = 20 * 1000        // floor a window so very short tracks still get rating time
 const MAX_CAP_MS = 6 * 60 * 1000      // safety cap so a stuck/paused song still reveals
@@ -73,6 +75,8 @@ export class TripRoom implements DurableObject {
     // playback_error). Re-read the token and (re)start the AI DJ.
     if (url.pathname === '/start-djing') {
       this.accessToken = null  // force token re-read now that the DJ has connected
+      await this.ctx.storage.put('tripStatus', 'active')    // clears a prior soft-stop or pause
+      await this.ctx.storage.delete('pausedRemainingMs')     // discard any frozen window
       await this.ensurePolling()
       // Only kick off playback if nothing is currently playing (avoids double-starts
       // on retry). advanceToNextSong is a no-op-safe entry point.
@@ -90,10 +94,73 @@ export class TripRoom implements DurableObject {
     }
 
     if (url.pathname === '/skip') {
+      if ((await this.getStatus()) !== 'active') return new Response('OK')  // no-op when paused/stopped
       const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-      if (windowEndsAt) {            // a song is currently playing
+      if (windowEndsAt) {
         await this.advanceNow()
       }
+      return new Response('OK')
+    }
+
+    if (url.pathname === '/pause') {
+      const status = await this.getStatus()
+      if (status === 'active') {
+        await this.ctx.storage.put('tripStatus', 'paused')
+        const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+        if (windowEndsAt) {
+          const remaining = Math.max(0, windowEndsAt - Date.now())
+          await this.ctx.storage.put('pausedRemainingMs', remaining)
+          await this.ctx.storage.delete('windowEndsAt')
+        }
+        const token = await this.getAccessToken()
+        if (token) await this.deps.pausePlayback(token)
+        const remainingMs = (await this.ctx.storage.get<number>('pausedRemainingMs')) ?? null
+        this.broadcastAll({ type: 'trip_paused', remainingMs })
+      }
+      return new Response('OK')
+    }
+
+    if (url.pathname === '/resume') {
+      const status = await this.getStatus()
+      if (status === 'paused') {
+        await this.ctx.storage.put('tripStatus', 'active')
+        await this.ensurePolling()
+        const remaining = await this.ctx.storage.get<number>('pausedRemainingMs')
+        if (remaining && remaining > 0) {
+          const token = await this.getAccessToken()
+          if (token) {
+            try {
+              await this.deps.resumePlayback(token)
+            } catch (e) {
+              if (e instanceof NoActiveDeviceError) {
+                await this.ctx.storage.put('djActive', false)
+                this.broadcastAll({ type: 'playback_error', reason: 'No active Spotify device. Open Spotify and press play, then tap Resume.' })
+                return new Response('OK')
+              }
+              throw e
+            }
+          }
+          const windowEnd = Date.now() + remaining
+          await this.ctx.storage.put('windowEndsAt', windowEnd)
+          await this.ctx.storage.delete('pausedRemainingMs')
+          const currentSong = await this.ctx.storage.get<SongInfo>('currentSong')
+          this.broadcastAll({ type: 'trip_resumed', windowEndsAt: windowEnd, song: currentSong ?? null })
+        } else {
+          // Paused between songs (no window was open) — resume kicks the next advance
+          this.broadcastAll({ type: 'trip_resumed', windowEndsAt: null, song: null })
+          if (!this.advancing) await this.advanceToNextSong()
+        }
+      }
+      return new Response('OK')
+    }
+
+    if (url.pathname === '/stop') {
+      await this.ctx.storage.put('tripStatus', 'stopped')
+      await this.ctx.storage.delete('windowEndsAt')
+      await this.ctx.storage.delete('pausedRemainingMs')
+      const token = await this.getAccessToken()
+      if (token) await this.deps.pausePlayback(token)
+      this.broadcastAll({ type: 'trip_stopped' })
       return new Response('OK')
     }
 
@@ -206,15 +273,20 @@ export class TripRoom implements DurableObject {
     // the next time a participant connects.
     if (this.ctx.getWebSockets().length === 0) return
 
+    const status = await this.getStatus()
+    if (status === 'stopped') return  // no setAlarm below → loop dies naturally
+
     try {
-      const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
-      if (windowEndsAt && Date.now() >= windowEndsAt) {
-        // The current song's window elapsed → reveal, then play the next one.
-        await this.advanceNow()
-      } else if (windowEndsAt) {
-        // Window still open — light sync only: catch a manual skip/stop on the DJ's
-        // own device so raters aren't stuck on a song that already ended.
-        await this.reconcilePlayback()
+      if (status === 'active') {
+        const windowEndsAt = await this.ctx.storage.get<number>('windowEndsAt')
+        if (windowEndsAt && Date.now() >= windowEndsAt) {
+          // The current song's window elapsed → reveal, then play the next one.
+          await this.advanceNow()
+        } else if (windowEndsAt) {
+          // Window still open — light sync only: catch a manual skip/stop on the DJ's
+          // own device so raters aren't stuck on a song that already ended.
+          await this.reconcilePlayback()
+        }
       }
       // Keep the next batch ready so a batch boundary never stalls playback.
       await this.maybePrefetch()
@@ -281,6 +353,10 @@ export class TripRoom implements DurableObject {
       if (queue.length === 0) { console.error('advanceToNextSong: queue still empty after batch generation — all picks unresolvable or Claude returned none'); return }
     }
 
+    // Status may have flipped to paused/stopped during batch generation above.
+    // Let the generated tracks sit in the queue, but don't start one.
+    if ((await this.getStatus()) !== 'active') return
+
     const track = queue.shift()!
     await this.ctx.storage.put('queue', queue)
 
@@ -299,6 +375,13 @@ export class TripRoom implements DurableObject {
       throw e
     }
     await this.ctx.storage.put('djActive', true)
+
+    // If pause/stop landed during the startPlayback await, re-pause the audio we just
+    // started and bail — don't open a live countdown over paused audio.
+    if ((await this.getStatus()) !== 'active') {
+      await this.deps.pausePlayback(token).catch(() => {})
+      return
+    }
 
     const playOrder = (await this.ctx.storage.get<number>('playOrder')) ?? 0
     const song = await createSong(this.env.DB, {
@@ -462,6 +545,8 @@ export class TripRoom implements DurableObject {
       myRating = ratings[participantId]?.emoji ?? null
     }
 
+    const status = await this.getStatus()
+    const pausedRemainingMs = (await this.ctx.storage.get<number>('pausedRemainingMs')) ?? null
     return {
       tripId,
       tripName,
@@ -476,6 +561,8 @@ export class TripRoom implements DurableObject {
       windowEndsAt,
       ratedCount,
       myRating,
+      status,
+      pausedRemainingMs,
     }
   }
 
@@ -486,9 +573,14 @@ export class TripRoom implements DurableObject {
   }
 
   private async ensurePolling(): Promise<void> {
+    if ((await this.getStatus()) === 'stopped') return   // participant join can't resurrect a stopped trip
     if (!(await this.ctx.storage.getAlarm())) {
       await this.ctx.storage.setAlarm(Date.now() + POLL_INTERVAL_MS)
     }
+  }
+
+  private async getStatus(): Promise<'active' | 'paused' | 'stopped'> {
+    return (await this.ctx.storage.get<'active' | 'paused' | 'stopped'>('tripStatus')) ?? 'active'
   }
 
   private send(ws: WebSocket, msg: ServerMessage): void {

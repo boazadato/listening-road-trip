@@ -78,7 +78,10 @@ async function handleApi(url: URL, method: string, request: Request, env: Env): 
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'leaderboard' && method === 'GET') return leaderboardHandler(parts[1], env)
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'analysis' && method === 'GET') return analysisHandler(parts[1], env)
   if (parts[0] === 'trips' && parts[1] && parts[2] === 'retry-dj' && method === 'POST') return retryDjHandler(parts[1], env)
-  if (parts[0] === 'trips' && parts[1] && parts[2] === 'skip' && method === 'POST') return skipHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'skip'     && method === 'POST') return skipHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'pause'    && method === 'POST') return pauseHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'resume'   && method === 'POST') return resumeHandler(parts[1], env)
+  if (parts[0] === 'trips' && parts[1] && parts[2] === 'stop'     && method === 'POST') return stopHandler(parts[1], env)
 
   return err('Not found', 404)
 }
@@ -96,6 +99,30 @@ async function skipHandler(code: string, env: Env): Promise<Response> {
   if (!trip) return err('Trip not found', 404)
   const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
   await stub.fetch('https://do/skip', { method: 'POST' })
+  return json({ ok: true })
+}
+
+async function pauseHandler(code: string, env: Env): Promise<Response> {
+  const trip = await getTripByCode(env.DB, code.toUpperCase())
+  if (!trip) return err('Trip not found', 404)
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
+  await stub.fetch('https://do/pause', { method: 'POST' })
+  return json({ ok: true })
+}
+
+async function resumeHandler(code: string, env: Env): Promise<Response> {
+  const trip = await getTripByCode(env.DB, code.toUpperCase())
+  if (!trip) return err('Trip not found', 404)
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
+  await stub.fetch('https://do/resume', { method: 'POST' })
+  return json({ ok: true })
+}
+
+async function stopHandler(code: string, env: Env): Promise<Response> {
+  const trip = await getTripByCode(env.DB, code.toUpperCase())
+  if (!trip) return err('Trip not found', 404)
+  const stub = env.TRIP_ROOM.get(env.TRIP_ROOM.idFromName(trip.id))
+  await stub.fetch('https://do/stop', { method: 'POST' })
   return json({ ok: true })
 }
 

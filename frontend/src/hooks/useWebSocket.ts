@@ -33,6 +33,9 @@ export function useWebSocket(tripId: string | null, participantId: string | null
       else if (msg.type === 'rating_update') store.setRatingUpdate(msg.ratedCount, msg.totalCount)
       else if (msg.type === 'rating_reveal') store.setReveal(msg.songId, msg.ratings, msg.averageScore)
       else if (msg.type === 'playback_error') store.setPlaybackError(msg.reason)
+      else if (msg.type === 'trip_paused')  store.setPaused(msg.remainingMs)
+      else if (msg.type === 'trip_resumed') store.setResumed(msg.windowEndsAt, msg.song)
+      else if (msg.type === 'trip_stopped') store.setStopped()
     }
 
     ws.onclose = () => {

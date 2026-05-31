@@ -120,3 +120,48 @@ describe('skip endpoint', () => {
     expect(res.status).toBe(404)
   })
 })
+
+describe('pause endpoint', () => {
+  it('returns { ok: true } for an existing trip', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/pause`, { method: 'POST' })
+    expect(res.status).toBe(200)
+    const data = await res.json<{ ok: boolean }>()
+    expect(data.ok).toBe(true)
+  })
+
+  it('returns 404 for an unknown trip code', async () => {
+    const res = await SELF.fetch('http://example.com/api/trips/ZZZZZZ/pause', { method: 'POST' })
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('resume endpoint', () => {
+  it('returns { ok: true } for an existing trip', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/resume`, { method: 'POST' })
+    expect(res.status).toBe(200)
+    const data = await res.json<{ ok: boolean }>()
+    expect(data.ok).toBe(true)
+  })
+
+  it('returns 404 for an unknown trip code', async () => {
+    const res = await SELF.fetch('http://example.com/api/trips/ZZZZZZ/resume', { method: 'POST' })
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('stop endpoint', () => {
+  it('returns { ok: true } for an existing trip', async () => {
+    const { trip } = await createTrip()
+    const res = await SELF.fetch(`http://example.com/api/trips/${trip.short_code}/stop`, { method: 'POST' })
+    expect(res.status).toBe(200)
+    const data = await res.json<{ ok: boolean }>()
+    expect(data.ok).toBe(true)
+  })
+
+  it('returns 404 for an unknown trip code', async () => {
+    const res = await SELF.fetch('http://example.com/api/trips/ZZZZZZ/stop', { method: 'POST' })
+    expect(res.status).toBe(404)
+  })
+})

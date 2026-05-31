@@ -128,6 +128,29 @@ export async function startPlayback(
   if (!res.ok && res.status !== 204) throw new Error(`Spotify play failed: ${res.status}`)
 }
 
+// Pause playback on the creator's active device. 404 (no active device) is tolerated —
+// nothing to pause, so treat as success.
+export async function pausePlayback(accessToken: string, fetchFn: typeof fetch = fetch): Promise<void> {
+  const res = await fetchFn('https://api.spotify.com/v1/me/player/pause', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (res.status === 404) return // no active device — nothing to pause
+  if (!res.ok && res.status !== 204) throw new Error(`Spotify pause failed: ${res.status}`)
+}
+
+// Resume playback from the paused position. PUT /play with NO body continues the current
+// track (a body with uris would restart from position 0). Unlike pause, a missing device
+// means the caller wanted audio, so we surface it via NoActiveDeviceError.
+export async function resumePlayback(accessToken: string, fetchFn: typeof fetch = fetch): Promise<void> {
+  const res = await fetchFn('https://api.spotify.com/v1/me/player/play', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (res.status === 404) throw new NoActiveDeviceError()
+  if (!res.ok && res.status !== 204) throw new Error(`Spotify resume failed: ${res.status}`)
+}
+
 // --- DJ taste seed (the DJ's own Spotify favorites) -----------------------------
 // Fetched at ride start by the DO (not at the OAuth callback — see Task 6), using a
 // freshly-refreshed access token, so the sample reflects the DJ's taste at the time

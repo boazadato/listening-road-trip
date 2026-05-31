@@ -25,6 +25,8 @@ export interface TripState {
   windowEndsAt: number | null
   ratedCount: number
   myRating: string | null
+  status: 'active' | 'paused' | 'stopped'
+  pausedRemainingMs: number | null
 }
 
 export type ServerMessage =
@@ -34,6 +36,9 @@ export type ServerMessage =
   | { type: 'rating_update'; ratedCount: number; totalCount: number }
   | { type: 'rating_reveal'; songId: string; ratings: RatingInfo[]; averageScore: number }
   | { type: 'playback_error'; reason: string }
+  | { type: 'trip_paused'; remainingMs: number | null }
+  | { type: 'trip_resumed'; windowEndsAt: number | null; song: SongInfo | null }
+  | { type: 'trip_stopped' }
   | { type: 'pong' }
 
 export type ClientMessage =

@@ -25,6 +25,8 @@ interface TripStore {
   totalCount: number
   myRating: string | null
   lastReveal: RevealedSong | null
+  status: 'active' | 'paused' | 'stopped'
+  pausedRemainingMs: number | null
 
   setIdentity: (participantId: string, participantName: string, tripCode: string) => void
   applyStateSync: (state: TripState) => void
@@ -34,6 +36,9 @@ interface TripStore {
   setReveal: (songId: string, ratings: RatingInfo[], averageScore: number) => void
   setMyRating: (emoji: string) => void
   setPlaybackError: (reason: string | null) => void
+  setPaused: (remainingMs: number | null) => void
+  setResumed: (windowEndsAt: number | null, song: SongInfo | null) => void
+  setStopped: () => void
 }
 
 export const useTripStore = create<TripStore>((set) => ({
@@ -53,6 +58,8 @@ export const useTripStore = create<TripStore>((set) => ({
   totalCount: 0,
   myRating: null,
   lastReveal: null,
+  status: 'active',
+  pausedRemainingMs: null,
 
   setIdentity: (participantId, participantName, tripCode) =>
     set({ participantId, participantName, tripCode }),
@@ -70,6 +77,8 @@ export const useTripStore = create<TripStore>((set) => ({
       ratedCount: state.ratedCount,
       totalCount: state.participants.length,
       myRating: state.myRating,
+      status: state.status,
+      pausedRemainingMs: state.pausedRemainingMs,
     }),
 
   addParticipant: (p) =>
@@ -80,7 +89,7 @@ export const useTripStore = create<TripStore>((set) => ({
 
   // A song playing means the AI DJ reached the device — clear any prior playback error.
   setSongStarted: (song, windowEndsAt, participantCount) =>
-    set({ currentSong: song, windowEndsAt, ratedCount: 0, totalCount: participantCount, myRating: null, lastReveal: null, djConnected: true, djActive: true, playbackError: null }),
+    set({ currentSong: song, windowEndsAt, ratedCount: 0, totalCount: participantCount, myRating: null, lastReveal: null, djConnected: true, djActive: true, playbackError: null, status: 'active', pausedRemainingMs: null }),
 
   setRatingUpdate: (ratedCount, totalCount) => set({ ratedCount, totalCount }),
 
@@ -90,4 +99,13 @@ export const useTripStore = create<TripStore>((set) => ({
   setMyRating: (emoji) => set({ myRating: emoji }),
 
   setPlaybackError: (reason) => set({ playbackError: reason, djActive: reason === null }),
+
+  setPaused: (remainingMs) =>
+    set({ status: 'paused', windowEndsAt: null, pausedRemainingMs: remainingMs }),
+
+  setResumed: (windowEndsAt, song) =>
+    set((s) => ({ status: 'active', windowEndsAt, pausedRemainingMs: null, currentSong: song ?? s.currentSong })),
+
+  setStopped: () =>
+    set({ status: 'stopped', windowEndsAt: null, pausedRemainingMs: null }),
 }))
