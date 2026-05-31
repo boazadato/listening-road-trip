@@ -26,6 +26,15 @@ const FALLBACK_WINDOW_MS = 90 * 1000  // used when a resolved track somehow lack
 const POLL_INTERVAL_MS = 5 * 1000     // 5 seconds
 const BATCH_SIZE = 5                   // songs Claude returns per generateSongBatch call
 const PREFETCH_AT = 1                  // when queue length drops to this, prefetch the next batch
+
+// A track we've already played this trip. `id` is the Spotify track id; it may be absent
+// on entries written before the id was stored — those fall back to title+artist matching.
+type PlayedEntry = { title: string; artist: string; id?: string }
+
+// Normalized title+artist identity, used only as a fallback for played entries with no id.
+function playedKey(t: { title: string; artist: string }): string {
+  return `${t.title} ${t.artist}`.toLowerCase().replace(/\s+/g, ' ').trim()
+}
 const AUTO_SKIP_THRESHOLD = 3          // avg rating strictly below this (😐) triggers auto-skip once a majority has rated
 const EMOJI_SCORES: Record<string, number> = {
   '🔥': 5, '❤️': 4, '😐': 3, '😬': 2, '💀': 1,
@@ -417,8 +426,9 @@ export class TripRoom implements DurableObject {
     const windowEnd = now + windowMs
 
     // Remember every played track (even unrated ones) so re-plan never repeats them.
-    const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
-    played.push({ title: track.title, artist: track.artist })
+    // Store the Spotify id too — it's the reliable identity for the dedup in generateAndEnqueueBatch.
+    const played = (await this.ctx.storage.get<PlayedEntry[]>('played')) ?? []
+    played.push({ title: track.title, artist: track.artist, id: track.id })
 
     await this.ctx.storage.put('currentSong', newSong)
     await this.ctx.storage.put('windowStartedAt', now)
@@ -445,7 +455,7 @@ export class TripRoom implements DurableObject {
       const seed = await this.getSeedPrefs(tripId)
       const djTaste = await this.getDjTasteSeed(tripId, token)        // DJ's own Spotify favorites (language/style signal)
       const history = await getRatingSummary(this.env.DB, tripId)   // rated songs + avg score (adaptation)
-      const played = (await this.ctx.storage.get<{ title: string; artist: string }[]>('played')) ?? []
+      const played = (await this.ctx.storage.get<PlayedEntry[]>('played')) ?? []
       let picks
       try {
         picks = await this.deps.generateSongBatch(seed, history, played, djTaste, this.env.CLAUDE_API_KEY, BATCH_SIZE)
@@ -455,18 +465,31 @@ export class TripRoom implements DurableObject {
       }
       console.log(`generateAndEnqueueBatch: Claude returned ${picks.length} picks`)
 
+      // Deterministic no-repeat guarantee: drop any resolved track already played, already
+      // queued, or duplicated within this batch — matched by Spotify id (with a title+artist
+      // fallback for legacy played entries that have no id). Does not rely on Claude obeying
+      // the text exclusion list in the prompt.
+      const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
+      const playedIds = new Set(played.map(p => p.id).filter((id): id is string => !!id))
+      const playedKeys = new Set(played.map(playedKey))
+      const seenIds = new Set(queue.map(t => t.id))
+
       const resolved: SpotifyTrack[] = []
       for (const pick of picks) {
         try {
           const track = await this.deps.searchTrack(token, pick.title, pick.artist)
-          if (track) resolved.push({ ...track, reason: pick.reason })
-          else console.log(`generateAndEnqueueBatch: Spotify search returned null for "${pick.title}" by ${pick.artist}`)
+          if (!track) { console.log(`generateAndEnqueueBatch: Spotify search returned null for "${pick.title}" by ${pick.artist}`); continue }
+          if (playedIds.has(track.id) || seenIds.has(track.id) || playedKeys.has(playedKey(track))) {
+            console.log(`generateAndEnqueueBatch: dropped repeat "${track.title}" by ${track.artist}`)
+            continue
+          }
+          seenIds.add(track.id)
+          resolved.push({ ...track, reason: pick.reason })
         } catch (e) {
           console.error(`generateAndEnqueueBatch: searchTrack threw for "${pick.title}" by ${pick.artist}:`, e)
         }
       }
       console.log(`generateAndEnqueueBatch: ${resolved.length}/${picks.length} picks resolved`)
-      const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
       const merged = [...queue, ...resolved]
       await this.ctx.storage.put('queue', merged)
       return merged

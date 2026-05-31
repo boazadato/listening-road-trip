@@ -121,9 +121,9 @@ export default function CurrentSong({ onRate, isCreator, onSkip, onPause, onResu
   return (
     <div>
       {currentSong.albumArt ? (
-        <img src={currentSong.albumArt} alt="Album art" style={{ width: '100%', borderRadius: 16, marginBottom: 16, aspectRatio: '1', objectFit: 'cover' }} />
+        <img src={currentSong.albumArt} alt="Album art" style={{ display: 'block', margin: '0 auto 16px', width: 'auto', maxWidth: '100%', maxHeight: '38vh', borderRadius: 16, aspectRatio: '1', objectFit: 'cover' }} />
       ) : (
-        <div style={{ width: '100%', aspectRatio: '1', background: 'var(--surface)', borderRadius: 16, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 64 }}>🎵</div>
+        <div style={{ width: '100%', maxHeight: '38vh', aspectRatio: '1', background: 'var(--surface)', borderRadius: 16, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 64 }}>🎵</div>
       )}
 
       <div style={{ textAlign: 'center', marginBottom: 16 }}>
@@ -146,69 +146,50 @@ export default function CurrentSong({ onRate, isCreator, onSkip, onPause, onResu
         onSelect={(emoji) => { if (isWindowOpen) onRate(currentSong.id, emoji) }}
       />
 
-      {isCreator && isWindowOpen && onSkip && (
-        <button
-          onClick={async () => {
-              setSkipping(true)
-              try {
-                await onSkip?.()
-              } catch {
-                setSkipping(false)  // reset on error; success resets via useEffect when next song arrives
-              }
-            }}
-          disabled={skipping}
-          style={{
-            display: 'block',
-            margin: '16px auto 0',
-            background: 'var(--surface2)',
-            color: 'var(--text)',
-            fontSize: 13,
-            padding: '8px 18px',
-            opacity: skipping ? 0.6 : 1,
-          }}
-        >
-          {skipping ? '⏭ Skipping…' : '⏭ Skip song'}
-        </button>
-      )}
+      {isCreator && (onSkip || onPause || onStop) && (
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap', marginTop: 16 }}>
+          {isWindowOpen && onSkip && (
+            <button
+              onClick={async () => {
+                setSkipping(true)
+                try {
+                  await onSkip?.()
+                } catch {
+                  setSkipping(false)  // reset on error; success resets via useEffect when next song arrives
+                }
+              }}
+              disabled={skipping}
+              style={{ background: 'var(--surface2)', color: 'var(--text)', fontSize: 13, padding: '8px 16px', opacity: skipping ? 0.6 : 1 }}
+            >
+              {skipping ? '⏭ Skipping…' : '⏭ Skip'}
+            </button>
+          )}
 
-      {isCreator && onPause && (
-        <button
-          onClick={async () => {
-            setPausing(true)
-            try { await onPause() } catch { setPausing(false) }
-          }}
-          disabled={pausing}
-          style={{
-            display: 'block',
-            margin: '8px auto 0',
-            background: 'var(--surface2)',
-            color: 'var(--text)',
-            fontSize: 13,
-            padding: '8px 18px',
-            opacity: pausing ? 0.6 : 1,
-          }}
-        >
-          {pausing ? '⏸ Pausing…' : '⏸ Pause'}
-        </button>
-      )}
+          {onPause && (
+            <button
+              onClick={async () => {
+                setPausing(true)
+                try { await onPause() } catch { setPausing(false) }
+              }}
+              disabled={pausing}
+              style={{ background: 'var(--surface2)', color: 'var(--text)', fontSize: 13, padding: '8px 16px', opacity: pausing ? 0.6 : 1 }}
+            >
+              {pausing ? '⏸ Pausing…' : '⏸ Pause'}
+            </button>
+          )}
 
-      {isCreator && onStop && (
-        <button
-          onClick={async () => {
-            if (!confirm('Stop the trip? You can restart it later.')) return
-            try { await onStop() } catch { /* no optimistic state needed */ }
-          }}
-          style={{
-            display: 'block',
-            margin: '8px auto 0',
-            background: 'var(--surface2)',
-            color: 'var(--text)',
-            fontSize: 13,
-            padding: '8px 18px',
-          }}
-        >
-          ⏹ Stop trip
-        </button>
+          {onStop && (
+            <button
+              onClick={async () => {
+                if (!confirm('Stop the trip? You can restart it later.')) return
+                try { await onStop() } catch { /* no optimistic state needed */ }
+              }}
+              style={{ background: 'var(--surface2)', color: 'var(--text)', fontSize: 13, padding: '8px 16px' }}
+            >
+              ⏹ Stop
+            </button>
+          )}
+        </div>
       )}
 
       {!isWindowOpen && <div style={{ textAlign: 'center', color: 'var(--text-dim)', fontSize: 14 }}>Rating closed</div>}

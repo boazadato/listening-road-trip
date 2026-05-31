@@ -110,18 +110,41 @@ export interface RatedSongSummary {
 //   • `history`    — in-trip crowd favorites/flops (empty for the first batch)
 // `djTaste` AUGMENTS the seed/ratings — it never overrides what the crowd actually likes.
 // `alreadyPlayed` is the exclusion list so we never repeat.
-export async function generateSongBatch(
+// Builds the song-selection prompt. Pure + exported so the phase branching is testable.
+// The trip "phase" is derived from how many songs have already been played:
+//   • < 10 played  → DJ-led: seed flavours + DJ taste seed + ratings, balanced as before
+//   • >= 10 played → crowd-led: the group's ratings drive selection; seed/DJ-taste are a soft guardrail
+export function buildSongBatchPrompt(
   seed: SeedPrefs,
   history: RatedSongSummary[],
   alreadyPlayed: { title: string; artist: string }[],
   djTaste: DjTasteTrack[],
-  apiKey: string,
-  count = 5
-): Promise<SongPick[]> {
+  count: number
+): string {
   const liked = [...history].filter(s => s.averageScore >= 3.5).sort((a, b) => b.averageScore - a.averageScore).slice(0, 5)
   const disliked = [...history].filter(s => s.averageScore < 3).sort((a, b) => a.averageScore - b.averageScore).slice(0, 5)
+  const likedStr = liked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'
+  const dislikedStr = disliked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'
 
-  const prompt = `You are the AI DJ for a road trip music rating game. Pick the next ${count} songs to play.
+  const playedCount = alreadyPlayed.length
+  const crowdLed = playedCount >= 10
+
+  let guidance: string
+  if (crowdLed) {
+    guidance = `The group has now heard ${playedCount} songs and rated enough to show their real taste. PRIORITIZE the crowd's ratings above all else:
+Crowd favorites: ${likedStr}
+Flops to avoid: ${dislikedStr}
+Strongly extend the styles, artists, and moods of the crowd favorites, and firmly avoid anything like the flops. The seed taste and the DJ's own favorites above are now only a SOFT guardrail — stay roughly within those genres/decades and ESPECIALLY keep the language/regional style (e.g. Hebrew), but do not let them override what the crowd actually likes. Follow the crowd.`
+  } else if (history.length === 0) {
+    guidance = `This is the first batch — go off the seed taste and the DJ's own favorites above.`
+  } else {
+    guidance = `Ratings so far (🔥=5 … 💀=1), use these to adapt:
+Crowd favorites: ${likedStr}
+Flops to avoid leaning on: ${dislikedStr}
+Lean toward the favorites' style; steer away from the flops while staying within the seed taste.`
+  }
+
+  return `You are the AI DJ for a road trip music rating game. Pick the next ${count} songs to play.
 
 Seed taste (set by the trip's DJ):
 - Genres: ${seed.genres.join(', ') || 'any'}
@@ -132,10 +155,7 @@ ${djTaste.length > 0 ? `
 The DJ's own Spotify favorites (a sample of what THEY actually listen to — infer their language and regional/cultural style from this, especially non-English / local-language music like Hebrew, and let it shape your picks within the genres/decades above):
 ${djTaste.map(t => `- "${t.title}" by ${t.artist}`).join('\n')}
 ` : ''}
-${history.length === 0 ? 'This is the first batch — go off the seed taste and the DJ\'s own favorites above.' : `Ratings so far (🔥=5 … 💀=1), use these to adapt:
-Crowd favorites: ${liked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'}
-Flops to avoid leaning on: ${disliked.map(s => `"${s.title}" by ${s.artist} (${s.averageScore.toFixed(1)})`).join('; ') || 'none yet'}
-Lean toward the favorites' style; steer away from the flops while staying within the seed taste.`}
+${guidance}
 
 Do NOT repeat any of these already-played songs:
 ${alreadyPlayed.map(s => `- "${s.title}" by ${s.artist}`).join('\n') || '- (none yet)'}
@@ -145,7 +165,17 @@ When picking songs for a genre or decade, prefer the languages listed above and 
 Return real, well-known, findable songs (exact title + primary artist as they appear on Spotify). For each, add a short one-line reason.
 
 Respond in JSON: { "songs": [ { "title": "...", "artist": "...", "reason": "..." } ] }`
+}
 
+export async function generateSongBatch(
+  seed: SeedPrefs,
+  history: RatedSongSummary[],
+  alreadyPlayed: { title: string; artist: string }[],
+  djTaste: DjTasteTrack[],
+  apiKey: string,
+  count = 5
+): Promise<SongPick[]> {
+  const prompt = buildSongBatchPrompt(seed, history, alreadyPlayed, djTaste, count)
   const result = parseJson<{ songs: SongPick[] }>(await callClaude(prompt, apiKey, 700))
   return Array.isArray(result.songs) ? result.songs : []
 }

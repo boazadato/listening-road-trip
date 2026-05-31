@@ -169,6 +169,54 @@ describe('TripRoom AI-DJ orchestration', () => {
     expect(types).toContain('song_started')
     expect(types.indexOf('song_started')).toBeGreaterThan(types.indexOf('rating_reveal'))
   })
+
+  it('does not re-enqueue a track whose Spotify id is already in played', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps({
+      generateSongBatch: vi.fn().mockResolvedValue([{ title: 'Dup', artist: 'X', reason: 'r' }]),
+      searchTrack: vi.fn().mockResolvedValue(track({ id: 'dup', uri: 'spotify:track:dup', title: 'Dup', artist: 'X' })),
+    })
+    const queue = await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('played', [{ title: 'Dup', artist: 'X', id: 'dup' }])
+      await state.storage.put('queue', [])
+      await instance.generateAndEnqueueBatch(tripId, 'tok')
+      return state.storage.get<SpotifyTrack[]>('queue')
+    })
+    expect(queue).toEqual([])   // repeat dropped, nothing enqueued
+  })
+
+  it('de-dupes two picks that resolve to the same track id within one batch', async () => {
+    const { stub, tripId } = await setupRoom()
+    const deps = fakeDeps({
+      generateSongBatch: vi.fn().mockResolvedValue([
+        { title: 'A', artist: 'X', reason: 'r1' },
+        { title: 'A (Remaster)', artist: 'X', reason: 'r2' },
+      ]),
+      searchTrack: vi.fn().mockResolvedValue(track({ id: 'same', uri: 'spotify:track:same', title: 'A', artist: 'X' })),
+    })
+    const queue = await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = deps
+      await state.storage.put('tripId', tripId)
+      await state.storage.put('played', [])
+      await state.storage.put('queue', [])
+      await instance.generateAndEnqueueBatch(tripId, 'tok')
+      return state.storage.get<SpotifyTrack[]>('queue')
+    })
+    expect(queue?.map(t => t.id)).toEqual(['same'])   // only one copy enqueued
+  })
+
+  it('records the Spotify id of every played track', async () => {
+    const { stub, tripId } = await setupRoom()
+    const played = await runInDurableObject(stub, async (instance: any, state) => {
+      instance.deps = fakeDeps()   // searchTrack → track() with id 't1'
+      await state.storage.put('tripId', tripId)
+      await instance.advanceToNextSong()
+      return state.storage.get<{ title: string; artist: string; id?: string }[]>('played')
+    })
+    expect(played?.[0]).toMatchObject({ title: 'Song', artist: 'Artist', id: 't1' })
+  })
 })
 
 describe('pause/resume/stop', () => {
