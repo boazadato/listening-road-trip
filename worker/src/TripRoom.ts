@@ -286,6 +286,12 @@ export class TripRoom implements DurableObject {
           // Window still open — light sync only: catch a manual skip/stop on the DJ's
           // own device so raters aren't stuck on a song that already ended.
           await this.reconcilePlayback()
+        } else if (!this.advancing) {
+          // No window open. Self-recover after a DO restart (or a start-djing that failed
+          // mid-way) by advancing if tracks are already queued or the DJ has played before.
+          const queue = (await this.ctx.storage.get<SpotifyTrack[]>('queue')) ?? []
+          const djActive = await this.ctx.storage.get<boolean>('djActive')
+          if (queue.length > 0 || djActive === true) await this.advanceToNextSong()
         }
       }
       // Keep the next batch ready so a batch boundary never stalls playback.

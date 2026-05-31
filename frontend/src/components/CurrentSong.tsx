@@ -21,7 +21,7 @@ export default function CurrentSong({ onRate, isCreator, onSkip, onPause, onResu
   const [pausing,    setPausing]    = useState(false)
   const [resuming,   setResuming]   = useState(false)
   const [restarting, setRestarting] = useState(false)
-  useEffect(() => { setSkipping(false) }, [currentSong?.id])
+  useEffect(() => { setSkipping(false); setRestarting(false) }, [currentSong?.id])
   useEffect(() => { setPausing(false); setResuming(false); setRestarting(false) }, [status])
 
   if (status === 'stopped') {
@@ -84,6 +84,18 @@ export default function CurrentSong({ onRate, isCreator, onSkip, onPause, onResu
         <div style={{ fontSize: 48, marginBottom: 16 }}>🎵</div>
         <div style={{ fontSize: 18, marginBottom: 8 }}>The AI DJ is picking the first song...</div>
         <div style={{ fontSize: 14 }}>Songs are chosen from the DJ's seed taste and adapt to your ratings</div>
+        {isCreator && onRestart && (
+          <button
+            onClick={async () => {
+              setRestarting(true)
+              try { await onRestart() } catch { setRestarting(false) }
+            }}
+            disabled={restarting}
+            style={{ marginTop: 24, opacity: restarting ? 0.6 : 1 }}
+          >
+            {restarting ? '▶ Starting…' : '▶ Start DJ'}
+          </button>
+        )}
       </div>
     )
   }
